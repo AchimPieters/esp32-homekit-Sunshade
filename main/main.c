@@ -451,7 +451,7 @@ static void calib_finish_on_stop(void) {
                 return;
         }
         uint32_t ms = (uint32_t)(elapsed / 1000);
-        ESP_LOGI("CAL", "Calibration DONE: full_travel_ms=%u", ms);
+        ESP_LOGI("CAL", "Calibration DONE: full_travel_ms=%" PRIu32, ms);
         full_travel_ms = ms;
         calib_save(ms);
 
@@ -482,63 +482,61 @@ static void hk_recal_switch_set(homekit_value_t value) {
 // -----------------------------------------------------------------------------
 // Buttons
 // -----------------------------------------------------------------------------
-static button_handle_t btn_open = NULL;
-static button_handle_t btn_stop = NULL;
-static button_handle_t btn_close = NULL;
 
-static void btn_open_single_cb(void *arg) {
+static void btn_open_callback(button_event_t event, void *context) {
+        if (event != button_event_single_press) return;
         if (calib_state == CAL_ARMED) { calib_start_run(); return; }
         if (calib_state == CAL_RUNNING) return; // ignore targets during calibration
         start_move_open();
+        (void)context;
 }
-static void btn_close_single_cb(void *arg) {
+
+static void btn_close_callback(button_event_t event, void *context) {
+        if (event != button_event_single_press) return;
         if (calib_state != CAL_IDLE) return; // ignore during calibration
         start_move_close();
+        (void)context;
 }
-static void btn_stop_single_cb(void *arg) {
-        if (calib_state == CAL_RUNNING) { calib_finish_on_stop(); return; }
-        // Normal STOP
-        homekit_value_t v = HOMEKIT_BOOL(true);
-        hold_position_set(v);
-}
-// Double-click STOP -> move to 50%
-static void btn_stop_double_cb(void *arg) {
-        if (calib_state != CAL_IDLE) return; // ignore during calibration
-        ESP_LOGI("BTN", "STOP double-click -> move to %d%%", MID_POSITION);
-        start_move_mid();
-}
-// Long-press STOP -> toggle calibration
-static void btn_stop_long_cb(void *arg) {
-        if (calib_state == CAL_IDLE) calib_enter();
-        else calib_cancel();
+
+static void btn_stop_callback(button_event_t event, void *context) {
+        switch (event) {
+        case button_event_single_press:
+                if (calib_state == CAL_RUNNING) { calib_finish_on_stop(); break; }
+                hold_position_set(HOMEKIT_BOOL(true));
+                break;
+        case button_event_double_press:
+                if (calib_state != CAL_IDLE) break; // ignore during calibration
+                ESP_LOGI("BTN", "STOP double-click -> move to %d%%", MID_POSITION);
+                start_move_mid();
+                break;
+        case button_event_long_press:
+                if (calib_state == CAL_IDLE) calib_enter();
+                else calib_cancel();
+                break;
+        default:
+                break;
+        }
+        (void)context;
 }
 
 static void buttons_init(void) {
-        button_config_t cfg_open = {
-                .type = BUTTON_TYPE_GPIO,
-                .long_press_time = 3000, // ms
-                .short_press_time = 50, // debounce/tap
-                .gpio_button_config = {
-                        .gpio_num = BTN_OPEN_GPIO,
-                        .active_level = CONFIG_BUTTON_ACTIVE_LEVEL
-                }
-        };
-        button_config_t cfg_stop = cfg_open;
-        cfg_stop.gpio_button_config.gpio_num = BTN_STOP_GPIO;
-        button_config_t cfg_close = cfg_open;
-        cfg_close.gpio_button_config.gpio_num = BTN_CLOSE_GPIO;
+        button_active_level_t active_level = CONFIG_BUTTON_ACTIVE_LEVEL ? button_active_high : button_active_low;
 
-        btn_open  = button_create(&cfg_open);
-        btn_stop  = button_create(&cfg_stop);
-        btn_close = button_create(&cfg_close);
+        button_config_t cfg_single = button_config_default(active_level);
+        button_config_t cfg_stop = button_config_default(active_level);
 
-        // The exact event names depend on the esp32-button version.
-        // These constants are typical for achimpieters/esp32-button:
-        button_add_on_press_cb(btn_open,   BUTTON_SINGLE_CLICK,       btn_open_single_cb,  NULL);
-        button_add_on_press_cb(btn_close,  BUTTON_SINGLE_CLICK,       btn_close_single_cb, NULL);
-        button_add_on_press_cb(btn_stop,   BUTTON_SINGLE_CLICK,       btn_stop_single_cb,  NULL);
-        button_add_on_press_cb(btn_stop,   BUTTON_DOUBLE_CLICK,       btn_stop_double_cb,  NULL);
-        button_add_on_press_cb(btn_stop,   BUTTON_LONG_PRESS_START,   btn_stop_long_cb,    NULL);
+        cfg_stop.long_press_time = 3000; // ms
+        cfg_stop.max_repeat_presses = 2; // enable double press detection
+
+        if (button_create(BTN_OPEN_GPIO, cfg_single, btn_open_callback, NULL)) {
+                ESP_LOGE("BTN", "Failed to init OPEN button");
+        }
+        if (button_create(BTN_CLOSE_GPIO, cfg_single, btn_close_callback, NULL)) {
+                ESP_LOGE("BTN", "Failed to init CLOSE button");
+        }
+        if (button_create(BTN_STOP_GPIO, cfg_stop, btn_stop_callback, NULL)) {
+                ESP_LOGE("BTN", "Failed to init STOP button");
+        }
 }
 
 // -----------------------------------------------------------------------------
@@ -625,9 +623,9 @@ void app_main(void) {
         uint32_t nvs_ms = 0;
         if (calib_load(&nvs_ms) == ESP_OK) {
                 full_travel_ms = nvs_ms;
-                ESP_LOGI("CAL", "Loaded full_travel_ms from NVS: %u ms", full_travel_ms);
+                ESP_LOGI("CAL", "Loaded full_travel_ms from NVS: %" PRIu32 " ms", full_travel_ms);
         } else {
-                ESP_LOGW("CAL", "No calibration found; using fallback %u ms", full_travel_ms);
+                ESP_LOGW("CAL", "No calibration found; using fallback %" PRIu32 " ms", full_travel_ms);
         }
 
         // Start Wi-Fi
