@@ -9,8 +9,8 @@ experience that can be provisioned through the Home app.
 
 ## Features
 
-- **HomeKit Window Covering service** with current/target position tracking, obstruction
-  reporting and optional momentary *Recalibrate* switch.
+- **HomeKit Window Covering service** with current/target position tracking and obstruction
+  reporting.
 - **Lifecycle Manager integration** for NVS initialization, OTA trigger exposure and
   automatic boot diagnostics.
 - **Persistent calibration**: the full travel time is measured once and stored in NVS so the
@@ -39,7 +39,6 @@ open fully. The resulting travel time is written to NVS so future moves scale co
 
 - Window Covering service (primary) with OTA trigger and hold-position support.
 - Accessory Information service with StudioPieters® metadata.
-- Optional Switch service exposed as **Recalibrate**, mirroring the STOP button long press.
 
 Set the HomeKit setup code and ID in `menuconfig` (`CONFIG_ESP_SETUP_CODE` and
 `CONFIG_ESP_SETUP_ID`).

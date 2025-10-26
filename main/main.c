@@ -1,6 +1,5 @@
 /**
  *  HomeKit Sunshade – ESP32
- *  - Optional HomeKit "Recalibrate" switch
  *  - Button double-click (STOP -> 50%)
  *  - Calibration with NVS persistence
  *  - NeoPixel status animations
@@ -221,7 +220,7 @@ homekit_characteristic_t revision     = HOMEKIT_CHARACTERISTIC_(FIRMWARE_REVISIO
 homekit_characteristic_t ota_trigger  = API_OTA_TRIGGER;
 
 // -----------------------------------------------------------------------------
-// Window Covering state + optional Recalibrate switch
+// Window Covering state
 // -----------------------------------------------------------------------------
 /*
  * HomeKit:
@@ -243,11 +242,6 @@ static homekit_characteristic_t obstruction_detected =
         HOMEKIT_CHARACTERISTIC_(OBSTRUCTION_DETECTED, false);
 static homekit_characteristic_t hold_position =
         HOMEKIT_CHARACTERISTIC_(HOLD_POSITION, false);
-
-// Optional HomeKit "Recalibrate" (momentary) switch characteristic
-static void hk_recal_switch_set(homekit_value_t value);
-static homekit_characteristic_t recalibrate_switch =
-        HOMEKIT_CHARACTERISTIC_(ON, false, .setter = hk_recal_switch_set);
 
 // Forward decl
 static void start_move_to(uint8_t target);
@@ -277,54 +271,80 @@ static esp_err_t calib_save(uint32_t ms) {
 // -----------------------------------------------------------------------------
 // Movement task
 // -----------------------------------------------------------------------------
+static void movement_finalize(void) {
+        motor_all_off();
+        if (position_state.value.uint8_value != 2) {
+                position_state.value = HOMEKIT_UINT8(2);
+                homekit_characteristic_notify(&position_state, position_state.value);
+        }
+
+        if (pos_f < 0.0f) pos_f = 0.0f;
+        if (pos_f > 100.0f) pos_f = 100.0f;
+        uint8_t cp = (uint8_t)(pos_f + 0.5f);
+
+        if (current_position.value.uint8_value != cp) {
+                current_position.value = HOMEKIT_UINT8(cp);
+                homekit_characteristic_notify(&current_position, current_position.value);
+        }
+        if (target_position.value.uint8_value != cp) {
+                target_position.value = HOMEKIT_UINT8(cp);
+                homekit_characteristic_notify(&target_position, target_position.value);
+        }
+
+        pix_state = (cp == 0 || cp == 100) ? PIX_IDLE : PIX_STOPPED;
+}
+
 static void move_task(void *param) {
         uint8_t tgt = (uint8_t)(intptr_t)param;
         const float step = (100.0f * (float)MOVE_TICK_MS) / (float)full_travel_ms; // % per tick
+        bool reached_target = false;
+        uint8_t start_cp = (uint8_t)(pos_f + 0.5f);
 
-        if (tgt > (uint8_t)pos_f) {
+        if (tgt > start_cp) {
                 position_state.value = HOMEKIT_UINT8(1); // opening
                 homekit_characteristic_notify(&position_state, position_state.value);
                 pix_state = PIX_OPENING;
                 motor_drive_open(true);
-                while (pos_f < tgt && position_state.value.uint8_value == 1) {
+                while (pos_f < (float)tgt) {
+                        if (position_state.value.uint8_value != 1) break;
                         pos_f += step;
+                        if (pos_f >= (float)tgt) {
+                                pos_f = (float)tgt;
+                                reached_target = true;
+                        }
                         if (pos_f > 100.0f) pos_f = 100.0f;
                         uint8_t cp = (uint8_t)(pos_f + 0.5f);
                         if (cp != current_position.value.uint8_value) {
                                 current_position.value = HOMEKIT_UINT8(cp);
                                 homekit_characteristic_notify(&current_position, current_position.value);
                         }
+                        if (reached_target) break;
                         vTaskDelay(pdMS_TO_TICKS(MOVE_TICK_MS));
                 }
-        } else if (tgt < (uint8_t)pos_f) {
+        } else if (tgt < start_cp) {
                 position_state.value = HOMEKIT_UINT8(0); // closing
                 homekit_characteristic_notify(&position_state, position_state.value);
                 pix_state = PIX_CLOSING;
                 motor_drive_close(true);
-                while (pos_f > tgt && position_state.value.uint8_value == 0) {
+                while (pos_f > (float)tgt) {
+                        if (position_state.value.uint8_value != 0) break;
                         pos_f -= step;
+                        if (pos_f <= (float)tgt) {
+                                pos_f = (float)tgt;
+                                reached_target = true;
+                        }
                         if (pos_f < 0.0f) pos_f = 0.0f;
                         uint8_t cp = (uint8_t)(pos_f + 0.5f);
                         if (cp != current_position.value.uint8_value) {
                                 current_position.value = HOMEKIT_UINT8(cp);
                                 homekit_characteristic_notify(&current_position, current_position.value);
                         }
+                        if (reached_target) break;
                         vTaskDelay(pdMS_TO_TICKS(MOVE_TICK_MS));
                 }
         }
 
-        motor_all_off();
-        position_state.value = HOMEKIT_UINT8(2); // stopped
-        homekit_characteristic_notify(&position_state, position_state.value);
-
-        // Snap exact target value
-        pos_f = tgt;
-        if (current_position.value.uint8_value != tgt) {
-                current_position.value = HOMEKIT_UINT8(tgt);
-                homekit_characteristic_notify(&current_position, current_position.value);
-        }
-
-        pix_state = (tgt == 0 || tgt == 100) ? PIX_IDLE : PIX_STOPPED;
+        movement_finalize();
 
         move_task_handle = NULL;
         vTaskDelete(NULL);
@@ -334,38 +354,29 @@ static void start_move_to(uint8_t target) {
         if (move_task_handle) {
                 vTaskDelete(move_task_handle);
                 move_task_handle = NULL;
+                movement_finalize();
         }
-        motor_all_off();
 
-        if (target == (uint8_t)pos_f) {
-                position_state.value = HOMEKIT_UINT8(2);
-                homekit_characteristic_notify(&position_state, position_state.value);
-                pix_state = PIX_STOPPED;
+        if (target_position.value.uint8_value != target) {
+                target_position.value = HOMEKIT_UINT8(target);
+                homekit_characteristic_notify(&target_position, target_position.value);
+        }
+
+        if (target == (uint8_t)(pos_f + 0.5f)) {
+                movement_finalize();
                 return;
         }
         xTaskCreate(move_task, "move", 3072, (void *)(intptr_t)target, 5, &move_task_handle);
 }
 
-// Convenience helpers that also notify target_position
+// Convenience helpers for fixed targets
 static void start_move_open(void) {
-        if (target_position.value.uint8_value != 100) {
-                target_position.value = HOMEKIT_UINT8(100);
-                homekit_characteristic_notify(&target_position, target_position.value);
-        }
         start_move_to(100);
 }
 static void start_move_close(void) {
-        if (target_position.value.uint8_value != 0) {
-                target_position.value = HOMEKIT_UINT8(0);
-                homekit_characteristic_notify(&target_position, target_position.value);
-        }
         start_move_to(0);
 }
 static void start_move_mid(void) { // used by STOP double-click
-        if (target_position.value.uint8_value != MID_POSITION) {
-                target_position.value = HOMEKIT_UINT8(MID_POSITION);
-                homekit_characteristic_notify(&target_position, target_position.value);
-        }
         start_move_to(MID_POSITION);
 }
 
@@ -376,9 +387,7 @@ static void target_position_set(homekit_value_t value) {
         if (value.format != homekit_format_uint8) return;
         uint8_t t = value.uint8_value;
         ESP_LOGI(MOTOR_TAG, "New target: %u", t);
-        target_position.value = value; // store
         start_move_to(t);
-        homekit_characteristic_notify(&target_position, target_position.value);
 }
 
 static void hold_position_set(homekit_value_t value) {
@@ -394,17 +403,12 @@ static void hold_position_set(homekit_value_t value) {
         homekit_characteristic_notify(&hold_position, hold_position.value);
 }
 
-// Recalibrate switch setter (momentary behavior)
-//  - ON -> if IDLE enter calibration; if already calibrating, cancel
-//  - Always auto-resets to OFF
-static void hk_recal_switch_set(homekit_value_t value);
-
 // -----------------------------------------------------------------------------
 // Calibration state machine
 // -----------------------------------------------------------------------------
 typedef enum {
         CAL_IDLE = 0,
-        CAL_ARMED, // activated via STOP long-press or Recalibrate switch
+        CAL_ARMED, // activated via STOP long-press
         CAL_RUNNING // measuring (opening while timing)
 } calib_state_t;
 
@@ -413,8 +417,12 @@ static int64_t calib_start_us = 0;
 
 static void calib_enter(void) {
         if (calib_state != CAL_IDLE) return;
+        if (move_task_handle) {
+                vTaskDelete(move_task_handle);
+                move_task_handle = NULL;
+        }
+        movement_finalize();
         ESP_LOGI("CAL", "Calibration MODE ON: set shade fully CLOSED, press OPEN to start timing, press STOP when fully OPEN.");
-        motor_all_off();
         calib_state = CAL_ARMED;
         pix_state = PIX_CALIBRATING;
 }
@@ -434,7 +442,11 @@ static void calib_start_run(void) {
         calib_start_us = esp_timer_get_time();
         calib_state = CAL_RUNNING;
         // Force fully open movement without altering HomeKit target
-        if (move_task_handle) { vTaskDelete(move_task_handle); move_task_handle = NULL; }
+        if (move_task_handle) {
+                vTaskDelete(move_task_handle);
+                move_task_handle = NULL;
+                movement_finalize();
+        }
         position_state.value = HOMEKIT_UINT8(1);
         homekit_characteristic_notify(&position_state, position_state.value);
         motor_drive_open(true);
@@ -461,22 +473,13 @@ static void calib_finish_on_stop(void) {
         position_state.value = HOMEKIT_UINT8(2);
         homekit_characteristic_notify(&current_position, current_position.value);
         homekit_characteristic_notify(&position_state, position_state.value);
+        if (target_position.value.uint8_value != 100) {
+                target_position.value = HOMEKIT_UINT8(100);
+                homekit_characteristic_notify(&target_position, target_position.value);
+        }
 
         calib_state = CAL_IDLE;
         pix_state = PIX_IDLE;
-}
-
-// Implement recalibrate switch setter now that helpers exist
-static void hk_recal_switch_set(homekit_value_t value) {
-        bool on = (value.format == homekit_format_bool) ? value.bool_value : false;
-        if (on) {
-                // Toggle-like behavior: pressing while active cancels
-                if (calib_state == CAL_IDLE) calib_enter();
-                else calib_cancel();
-        }
-        // Momentary: auto-reset to OFF
-        recalibrate_switch.value = HOMEKIT_BOOL(false);
-        homekit_characteristic_notify(&recalibrate_switch, recalibrate_switch.value);
 }
 
 // -----------------------------------------------------------------------------
@@ -563,12 +566,6 @@ homekit_accessory_t *accessories[] = {
                         &obstruction_detected,
                         HOMEKIT_CHARACTERISTIC(HOLD_POSITION, false, .setter = hold_position_set),
                         &ota_trigger,
-                        NULL
-                }),
-                // Optional: Recalibrate switch (momentary)
-                HOMEKIT_SERVICE(SWITCH, .characteristics = (homekit_characteristic_t*[]) {
-                        HOMEKIT_CHARACTERISTIC(NAME, "Recalibrate"),
-                        &recalibrate_switch,
                         NULL
                 }),
                 NULL
