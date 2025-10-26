@@ -1,27 +1,81 @@
 menu "StudioPieters"
 
-      config ESP_LED_GPIO
-              int "Set the GPIO for the LED"
-              default 2
-              help
-                  The GPIO number the LED is connected to.
+    config ESP_LED_GPIO
+        int "Identify LED GPIO"
+        range 0 39
+        default 23
+        help
+            GPIO number of the identify/status LED.
 
-      config ESP_BUTTON_GPIO
-              int "Button GPIO"
-              default 32
-              help
-                  GPIO van de knop (actief laag als je button_config_default(button_active_low) gebruikt).
+    config ESP_OPEN_GPIO
+        int "Relay OPEN GPIO"
+        range 0 39
+        default 16
+        help
+            GPIO pin that drives the relay for OPEN.
 
-      config ESP_SETUP_CODE
-              string "HomeKit Setup Code"
-              default "338-77-883"
-              help
-                  If you want to change the HomeKit Setup Code, you can do that here (Note:  you need to make a new QR-CODE To make it work)
+    config ESP_CLOSE_GPIO
+        int "Relay CLOSE GPIO"
+        range 0 39
+        default 17
+        help
+            GPIO pin that drives the relay for CLOSE.
 
-      config ESP_SETUP_ID
-              string "HomeKit Setup ID"
-              default "1QJ8"
-              help
-                   If you want to change the HomeKit Setup ID, you can do that here (Note: you need to make a new QR-CODE To make it work)
+    config RELAY_ACTIVE_LEVEL
+        int "Relay active level (1=HIGH, 0=LOW)"
+        range 0 1
+        default 1
+        help
+            Set to 1 for relay modules that are active HIGH, or 0 for active LOW modules.
+
+    config BTN_OPEN_GPIO
+        int "Button OPEN GPIO"
+        range 0 39
+        default 27
+        help
+            GPIO pin for the OPEN button.
+
+    config BTN_STOP_GPIO
+        int "Button STOP GPIO"
+        range 0 39
+        default 26
+        help
+            GPIO pin for the STOP button.
+
+    config BTN_CLOSE_GPIO
+        int "Button CLOSE GPIO"
+        range 0 39
+        default 25
+        help
+            GPIO pin for the CLOSE button.
+
+    config BUTTON_ACTIVE_LEVEL
+        int "Button active level (0=LOW, 1=HIGH)"
+        range 0 1
+        default 0
+        help
+            Set to 0 when buttons pull to GND with internal pull-up enabled (recommended).
+            Set to 1 if your buttons pull to VCC instead (active-high wiring).
+
+    config NEOPIXEL_GPIO
+        int "NeoPixel GPIO"
+        range 0 39
+        default 18
+        help
+            Data pin of the (single) NeoPixel / WS2812 LED.
+
+    config ESP_SETUP_CODE
+        string "HomeKit Setup Code"
+        default "714-14-147"
+        help
+            Change the HomeKit setup code here.
+            Note: you must regenerate the QR code if you change this.
+
+    config ESP_SETUP_ID
+        string "HomeKit Setup ID"
+        default "W1C4"
+        help
+            Change the HomeKit setup ID here.
+            Note: you must regenerate the QR code if you change this.
 
 endmenu

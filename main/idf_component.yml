@@ -5,3 +5,5 @@ dependencies:
     version: ">=1.2.5"
   achimpieters/esp32-button:
     version: ">=1.2.3"
+  espressif/led_strip:
+    version: "^3.0.1"
