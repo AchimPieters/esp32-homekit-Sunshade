@@ -1,189 +1,103 @@
-# Lifecycle Manager LED Example
+# HomeKit Sunshade for ESP32
 
-This folder contains a complete HomeKit LED accessory that uses the **Lifecycle Manager (LCM)**. The guide below walks you step by step through converting the original demo (without LCM) into the new LCM-enabled version. It is written for beginners: for every section you learn what to add, why it matters, and what it does.
+This project implements a complete HomeKit window covering accessory for ESP32 based on the
+StudioPieters® sunshade controller firmware. It combines relay control, physical buttons,
+status lighting and the Lifecycle Manager (LCM) helper library to deliver a polished user
+experience that can be provisioned through the Home app.
 
-## 1. Understand the basics
+![Sunshade wiring scheme](scheme.png)
 
-| Component | Without LCM | With LCM |
-|-----------|-------------|----------|
-| Wi-Fi management | Manually handle every Wi-Fi event yourself. | Call `wifi_start()` from the LCM to start Wi-Fi and reconnect automatically. |
-| Storage | Initialize and reset NVS manually. | `lifecycle_nvs_init()` performs the setup and logs the reset state. |
-| OTA updates & firmware versions | Not available. | The LCM exposes an OTA trigger and reads the firmware version from NVS. |
-| Restore/reset | Reset manually through HomeKit. | Use lifecycle functions for updates, factory resets, and the automatic reboot counter. |
+## Features
 
-The rest of this document shows how to update the old code to the new version, with an explanation at each step.
+- **HomeKit Window Covering service** with current/target position tracking, obstruction
+  reporting and optional momentary *Recalibrate* switch.
+- **Lifecycle Manager integration** for NVS initialization, OTA trigger exposure and
+  automatic boot diagnostics.
+- **Persistent calibration**: the full travel time is measured once and stored in NVS so the
+  shade position stays in sync after reboots.
+- **Three hard-wired buttons** (OPEN, STOP, CLOSE) with single/double/long press handling via
+  [`esp32-button`](https://github.com/achimpieters/esp32-button).
+- **Status lighting**: a discrete LED plus a NeoPixel provide feedback for Wi-Fi provisioning,
+  movement, calibration and idle states.
+- **Relay interlock** that guarantees OPEN and CLOSE coils are never energized at the same
+  time.
 
-## 2. Include the headers
+## Button behaviour
 
-**Why:** The LCM and the button library provide ready-to-use functions. Import the right headers to access them.
+| Button | Action | Notes |
+| ------ | ------ | ----- |
+| OPEN   | Single press | Moves the shade to 100 % (or starts the calibration run when armed). |
+| STOP   | Single press | Stops movement; during calibration it finalizes the measurement. |
+| STOP   | Double press | Moves the shade to the configured mid position (50 % by default). |
+| STOP   | Long press | Toggles calibration mode (armed ↔ idle). |
+| CLOSE  | Single press | Moves the shade to 0 %. |
 
-```c
-#include "esp32-lcm.h"   // pull in the Lifecycle Manager
-#include <button.h>       // button events without extra boilerplate
-```
+During calibration the NeoPixel glows purple and the controller measures the time needed to
+open fully. The resulting travel time is written to NVS so future moves scale correctly.
 
-**What it does:**
-- `esp32-lcm.h` gives you the lifecycle, OTA, and Wi-Fi helper functions.
-- `button.h` makes it easy to detect single, double, and long presses.
+## HomeKit characteristics
 
-Do not forget to use the `CONFIG_ESP_BUTTON_GPIO` macro so the button pin can be set through `menuconfig`.
+- Window Covering service (primary) with OTA trigger and hold-position support.
+- Accessory Information service with StudioPieters® metadata.
+- Optional Switch service exposed as **Recalibrate**, mirroring the STOP button long press.
 
-## 3. Extend the HomeKit characteristics
+Set the HomeKit setup code and ID in `menuconfig` (`CONFIG_ESP_SETUP_CODE` and
+`CONFIG_ESP_SETUP_ID`).
 
-**Why:** The LCM manages the firmware version and exposes a default OTA trigger. Add these characteristics to HomeKit so you can use them from the Home app.
+## Hardware configuration
 
-Replace the manual firmware version with the LCM constant and add the OTA trigger:
+All GPIO assignments are configurable through `menuconfig` and checked into
+`main/Kconfig.projbuild`:
 
-```c
-homekit_characteristic_t revision =
-    HOMEKIT_CHARACTERISTIC_(FIRMWARE_REVISION, LIFECYCLE_DEFAULT_FW_VERSION);
-homekit_characteristic_t ota_trigger = API_OTA_TRIGGER;
-```
+| Function | Kconfig option |
+| -------- | -------------- |
+| Identify LED | `CONFIG_ESP_LED_GPIO` |
+| NeoPixel DIN | `CONFIG_NEOPIXEL_GPIO` |
+| Relay – Open | `CONFIG_ESP_OPEN_GPIO` |
+| Relay – Close | `CONFIG_ESP_CLOSE_GPIO` |
+| Button – Open | `CONFIG_BTN_OPEN_GPIO` |
+| Button – Stop | `CONFIG_BTN_STOP_GPIO` |
+| Button – Close | `CONFIG_BTN_CLOSE_GPIO` |
+| Button active level | `CONFIG_BUTTON_ACTIVE_LEVEL` |
+| Relay active level | `CONFIG_RELAY_ACTIVE_LEVEL` |
 
-Then add `&ota_trigger` to the Lightbulb service. This allows you to start an update from the Home app without pressing a hardware button.
+Classic ESP32 pins (0–39) are supported out of the box. Consult the comments in
+`main/main.c` for suggested pin mappings when targeting ESP32-S3 or ESP32-C3 variants.
 
-## 4. Initialize the lifecycle in `app_main`
+## Building and flashing
 
-**Why:** The LCM tracks the device state (reboot counter, firmware version, HomeKit data). Without this initialization the lifecycle features do not work.
+1. Install [ESP-IDF 5.x](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/).
+2. Clone this repository together with its managed components (the `idf.py set-target` and
+   `idf.py add-dependency` commands are handled automatically via `main/idf_component.yml`).
+3. Configure the project:
+   ```bash
+   idf.py menuconfig
+   ```
+   Set the GPIO numbers, Wi-Fi credentials (if you use the Wi-Fi provisioning example) and
+   the HomeKit setup payload.
+4. Build and flash:
+   ```bash
+   idf.py build
+   idf.py -p /dev/ttyUSB0 flash monitor
+   ```
 
-```c
-ESP_ERROR_CHECK(lifecycle_nvs_init());
-lifecycle_log_post_reset_state("INFORMATION");
-ESP_ERROR_CHECK(
-    lifecycle_configure_homekit(&revision, &ota_trigger, "INFORMATION"));
-```
+After the first boot the accessory enters provisioning mode. Add it from the Apple Home app
+using the setup code you configured. Once paired, you can trigger OTA updates from the Home
+app or via the STOP button single press (which maps to the Lifecycle Manager OTA request).
 
-**What it does:**
-- `lifecycle_nvs_init()` initializes NVS and prepares the lifecycle tables.
-- `lifecycle_log_post_reset_state()` logs whether you booted after a brownout, crash, etc.
-- `lifecycle_configure_homekit()` links the OTA trigger and firmware version to HomeKit.
+## Troubleshooting tips
 
-## 5. Let the LCM start Wi-Fi
+- If the shade moves too far or not far enough, enter calibration mode with a long press on
+  the STOP button, fully close the shade, press OPEN to start, then press STOP when fully open.
+- NeoPixel colour legend:
+  - **Orange breathing** – waiting for Wi-Fi provisioning.
+  - **Green/Red solid** – opening/closing.
+  - **Cyan solid** – stopped mid-travel.
+  - **Purple breathing** – calibration active.
+  - **Soft white** – idle and connected.
+- The firmware revision displayed in HomeKit comes from `LIFECYCLE_DEFAULT_FW_VERSION` in the
+  Lifecycle Manager component. Update it when publishing new firmware builds.
 
-**Why:** In the old code you had to register events and call `esp_wifi_*` functions manually. The LCM handles this and takes provisioning into account.
+## License
 
-```c
-esp_err_t wifi_err = wifi_start(on_wifi_ready);
-```
-
-**What it does:**
-- Starts Wi-Fi in station mode automatically.
-- Calls `on_wifi_ready()` when the connection is established.
-- Makes it clear whether provisioning is still required (`ESP_ERR_NVS_NOT_FOUND`).
-
-## 6. Buttons for updates and factory reset
-
-**Why:** Hardware buttons can now trigger OTA updates or factory resets without writing your own timers and debouncing code.
-
-```c
-button_config_t btn_cfg = button_config_default(button_active_low);
-btn_cfg.max_repeat_presses = 3;
-btn_cfg.long_press_time = 1000;
-
-if (button_create(BUTTON_GPIO, btn_cfg, button_callback, NULL)) {
-    ESP_LOGE("BUTTON", "Failed to initialize button");
-}
-```
-
-Handle the different events in the callback:
-
-```c
-void button_callback(button_event_t event, void *context) {
-    switch (event) {
-    case button_event_single_press:
-        lifecycle_request_update_and_reboot();
-        break;
-    case button_event_double_press:
-        homekit_server_reset();
-        esp_restart();
-        break;
-    case button_event_long_press:
-        lifecycle_factory_reset_and_reboot();
-        break;
-    }
-}
-```
-
-**What it does:**
-- **Single press:** requests an OTA update from the LCM and restarts afterwards.
-- **Double press:** resets the HomeKit pairing.
-- **Long press:** performs a full factory reset (Wi-Fi and HomeKit included).
-
-## 7. LED control and HomeKit logic
-
-The core LED helpers (`gpio_init`, `led_write`, `led_on_set`) stay almost the same. Add extra `ESP_LOGI` messages so the serial monitor shows when the LED toggles.
-
-## 8. Putting it all together
-
-Once you follow the steps above, the start of your file should look like this:
-
-```c
-#include "esp32-lcm.h"
-#include <button.h>
-
-#define BUTTON_GPIO CONFIG_ESP_BUTTON_GPIO
-#define LED_GPIO    CONFIG_ESP_LED_GPIO
-```
-
-And the `app_main` function:
-
-```c
-void app_main(void) {
-    ESP_ERROR_CHECK(lifecycle_nvs_init());
-    lifecycle_log_post_reset_state("INFORMATION");
-    ESP_ERROR_CHECK(lifecycle_configure_homekit(&revision, &ota_trigger,
-                                                "INFORMATION"));
-
-    gpio_init();
-
-    button_config_t btn_cfg = button_config_default(button_active_low);
-    btn_cfg.max_repeat_presses = 3;
-    btn_cfg.long_press_time = 1000;
-    if (button_create(BUTTON_GPIO, btn_cfg, button_callback, NULL)) {
-        ESP_LOGE("BUTTON", "Failed to initialize button");
-    }
-
-    esp_err_t wifi_err = wifi_start(on_wifi_ready);
-    if (wifi_err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW("WIFI", "WiFi configuration not found; provisioning required");
-    } else if (wifi_err != ESP_OK) {
-        ESP_LOGE("WIFI", "Failed to start WiFi: %s", esp_err_to_name(wifi_err));
-    }
-}
-```
-
-## 9. Expected behavior
-
-- **HomeKit characteristics** automatically show the correct firmware version.
-- **OTA** can be triggered from the Home app (Lifecycle service) or via the button (single press).
-- **Factory reset** is available through a long press or automatically after 10 quick restarts (configurable through `menuconfig`).
-- **Wi-Fi** starts automatically or requests provisioning if no credentials are stored.
-
-## 10. Wiring
-
-Connect the pins as described below (configurable via `menuconfig`):
-
-| Name | Description | Default |
-|------|-------------|---------|
-| `CONFIG_ESP_LED_GPIO` | GPIO for the LED | `2` |
-| `CONFIG_ESP_BUTTON_GPIO` | GPIO for the button | `32` |
-
-## 11. Schematic
-
-![HomeKit LED](https://github.com/AchimPieters/esp32-lifecycle-manager/blob/main/examples/led/scheme.png)
-
-## 12. Requirements
-
-- **idf version:** `>=5.0`
-- **espressif/mdns version:** `1.8.0`
-- **wolfssl/wolfssl version:** `5.7.6`
-- **achimpieters/esp32-homekit version:** `1.0.0`
-- **achimpieters/button version:** `1.2.3`
-
-## 13. Menuconfig tips
-
-- Set your GPIO numbers, Wi-Fi SSID, and password in the `StudioPieters` menu.
-- Adjust the `HomeKit Setup Code` and `Setup ID` if needed. Remember to generate a new QR code when you do.
-- Configure the reboot counter timeout in `Lifecycle Manager` to control automatic factory resets.
-
-By following these steps, you convert the original LED demo into a version that leverages the Lifecycle Manager. You gain OTA updates, consistent firmware information, and straightforward reset scenarios without complex extra code.
+Distributed under the same terms as the original StudioPieters® firmware (see `LICENSE`).
