@@ -244,6 +244,24 @@ static homekit_characteristic_t obstruction_detected =
 static homekit_characteristic_t hold_position =
         HOMEKIT_CHARACTERISTIC_(HOLD_POSITION, false);
 
+static inline void notify_current_position(uint8_t cp) {
+        if (current_position.value.uint8_value == cp) return;
+        current_position.value = HOMEKIT_UINT8(cp);
+        homekit_characteristic_notify(&current_position, current_position.value);
+}
+
+static inline void notify_target_position(uint8_t tp) {
+        if (target_position.value.uint8_value == tp) return;
+        target_position.value = HOMEKIT_UINT8(tp);
+        homekit_characteristic_notify(&target_position, target_position.value);
+}
+
+static inline void notify_position_state(uint8_t state) {
+        if (position_state.value.uint8_value == state) return;
+        position_state.value = HOMEKIT_UINT8(state);
+        homekit_characteristic_notify(&position_state, position_state.value);
+}
+
 // Forward decl
 static void start_move_to(uint8_t target);
 
@@ -274,23 +292,14 @@ static esp_err_t calib_save(uint32_t ms) {
 // -----------------------------------------------------------------------------
 static void movement_finalize(void) {
         motor_all_off();
-        if (position_state.value.uint8_value != 2) {
-                position_state.value = HOMEKIT_UINT8(2);
-                homekit_characteristic_notify(&position_state, position_state.value);
-        }
+        notify_position_state(2);
 
         if (pos_f < 0.0f) pos_f = 0.0f;
         if (pos_f > 100.0f) pos_f = 100.0f;
         uint8_t cp = (uint8_t)(pos_f + 0.5f);
 
-        if (current_position.value.uint8_value != cp) {
-                current_position.value = HOMEKIT_UINT8(cp);
-                homekit_characteristic_notify(&current_position, current_position.value);
-        }
-        if (target_position.value.uint8_value != cp) {
-                target_position.value = HOMEKIT_UINT8(cp);
-                homekit_characteristic_notify(&target_position, target_position.value);
-        }
+        notify_current_position(cp);
+        notify_target_position(cp);
 
         pix_state = (cp == 0 || cp == 100) ? PIX_IDLE : PIX_STOPPED;
 }
@@ -314,17 +323,25 @@ static void movement_stop(bool guard_delay) {
 
 static void move_task(void *param) {
         uint8_t tgt = (uint8_t)(intptr_t)param;
-        const float step = (100.0f * (float)MOVE_TICK_MS) / (float)full_travel_ms; // % per tick
         bool reached_target = false;
         uint8_t start_cp = (uint8_t)(pos_f + 0.5f);
+        int64_t last_tick_us = esp_timer_get_time() - ((int64_t)MOVE_TICK_MS * 1000);
+
+        if (last_tick_us > esp_timer_get_time()) {
+                last_tick_us = esp_timer_get_time();
+        }
 
         if (tgt > start_cp) {
-                position_state.value = HOMEKIT_UINT8(1); // opening
-                homekit_characteristic_notify(&position_state, position_state.value);
+                notify_position_state(1); // opening
                 pix_state = PIX_OPENING;
                 motor_drive_open(true);
                 while (pos_f < (float)tgt) {
                         if (position_state.value.uint8_value != 1) break;
+                        int64_t now = esp_timer_get_time();
+                        float delta_ms = (float)(now - last_tick_us) / 1000.0f;
+                        if (delta_ms <= 0.0f) delta_ms = MOVE_TICK_MS;
+                        last_tick_us = now;
+                        float step = (100.0f * delta_ms) / (float)full_travel_ms;
                         pos_f += step;
                         if (pos_f >= (float)tgt) {
                                 pos_f = (float)tgt;
@@ -332,20 +349,21 @@ static void move_task(void *param) {
                         }
                         if (pos_f > 100.0f) pos_f = 100.0f;
                         uint8_t cp = (uint8_t)(pos_f + 0.5f);
-                        if (cp != current_position.value.uint8_value) {
-                                current_position.value = HOMEKIT_UINT8(cp);
-                                homekit_characteristic_notify(&current_position, current_position.value);
-                        }
+                        notify_current_position(cp);
                         if (reached_target) break;
                         vTaskDelay(pdMS_TO_TICKS(MOVE_TICK_MS));
                 }
         } else if (tgt < start_cp) {
-                position_state.value = HOMEKIT_UINT8(0); // closing
-                homekit_characteristic_notify(&position_state, position_state.value);
+                notify_position_state(0); // closing
                 pix_state = PIX_CLOSING;
                 motor_drive_close(true);
                 while (pos_f > (float)tgt) {
                         if (position_state.value.uint8_value != 0) break;
+                        int64_t now = esp_timer_get_time();
+                        float delta_ms = (float)(now - last_tick_us) / 1000.0f;
+                        if (delta_ms <= 0.0f) delta_ms = MOVE_TICK_MS;
+                        last_tick_us = now;
+                        float step = (100.0f * delta_ms) / (float)full_travel_ms;
                         pos_f -= step;
                         if (pos_f <= (float)tgt) {
                                 pos_f = (float)tgt;
@@ -353,10 +371,7 @@ static void move_task(void *param) {
                         }
                         if (pos_f < 0.0f) pos_f = 0.0f;
                         uint8_t cp = (uint8_t)(pos_f + 0.5f);
-                        if (cp != current_position.value.uint8_value) {
-                                current_position.value = HOMEKIT_UINT8(cp);
-                                homekit_characteristic_notify(&current_position, current_position.value);
-                        }
+                        notify_current_position(cp);
                         if (reached_target) break;
                         vTaskDelay(pdMS_TO_TICKS(MOVE_TICK_MS));
                 }
@@ -375,10 +390,7 @@ static void start_move_to(uint8_t target) {
                 movement_stop(true);
         }
 
-        if (target_position.value.uint8_value != target) {
-                target_position.value = HOMEKIT_UINT8(target);
-                homekit_characteristic_notify(&target_position, target_position.value);
-        }
+        notify_target_position(target);
 
         if (target == (uint8_t)(pos_f + 0.5f)) {
                 movement_finalize();
@@ -455,8 +467,7 @@ static void calib_start_run(void) {
         calib_state = CAL_RUNNING;
         // Force fully open movement without altering HomeKit target
         movement_stop(false);
-        position_state.value = HOMEKIT_UINT8(1);
-        homekit_characteristic_notify(&position_state, position_state.value);
+        notify_position_state(1);
         motor_drive_open(true);
         pix_state = PIX_CALIBRATING;
 }
@@ -477,14 +488,9 @@ static void calib_finish_on_stop(void) {
 
         // Set position = 100 (fully open)
         pos_f = 100.0f;
-        current_position.value = HOMEKIT_UINT8(100);
-        position_state.value = HOMEKIT_UINT8(2);
-        homekit_characteristic_notify(&current_position, current_position.value);
-        homekit_characteristic_notify(&position_state, position_state.value);
-        if (target_position.value.uint8_value != 100) {
-                target_position.value = HOMEKIT_UINT8(100);
-                homekit_characteristic_notify(&target_position, target_position.value);
-        }
+        notify_current_position(100);
+        notify_position_state(2);
+        notify_target_position(100);
 
         calib_state = CAL_IDLE;
         pix_state = PIX_IDLE;
