@@ -62,6 +62,7 @@
 // Motion model (fallback). Will be overridden after calibration load from NVS.
 #define FULL_TRAVEL_MS_DEFAULT    18000
 #define MOVE_TICK_MS              100
+#define DIRECTION_CHANGE_GUARD_MS 200   // ms pause between reversing commands
 #define MID_POSITION              50     // used for STOP double-click
 
 // -----------------------------------------------------------------------------
@@ -294,6 +295,23 @@ static void movement_finalize(void) {
         pix_state = (cp == 0 || cp == 100) ? PIX_IDLE : PIX_STOPPED;
 }
 
+// Stop any ongoing movement task and optionally pause to guard relay direction changes.
+static void movement_stop(bool guard_delay) {
+        bool had_task = (move_task_handle != NULL);
+        uint8_t prev_state = position_state.value.uint8_value;
+
+        if (had_task) {
+                vTaskDelete(move_task_handle);
+                move_task_handle = NULL;
+        }
+
+        movement_finalize();
+
+        if (guard_delay && (had_task || prev_state != 2)) {
+                vTaskDelay(pdMS_TO_TICKS(DIRECTION_CHANGE_GUARD_MS));
+        }
+}
+
 static void move_task(void *param) {
         uint8_t tgt = (uint8_t)(intptr_t)param;
         const float step = (100.0f * (float)MOVE_TICK_MS) / (float)full_travel_ms; // % per tick
@@ -351,10 +369,10 @@ static void move_task(void *param) {
 }
 
 static void start_move_to(uint8_t target) {
-        if (move_task_handle) {
-                vTaskDelete(move_task_handle);
-                move_task_handle = NULL;
-                movement_finalize();
+        bool was_moving = (move_task_handle != NULL) || (position_state.value.uint8_value != 2);
+
+        if (was_moving) {
+                movement_stop(true);
         }
 
         if (target_position.value.uint8_value != target) {
@@ -394,9 +412,7 @@ static void hold_position_set(homekit_value_t value) {
         if (value.format != homekit_format_bool) return;
         if (value.bool_value) {
                 ESP_LOGI(MOTOR_TAG, "Hold position (STOP)");
-                motor_all_off();
-                position_state.value = HOMEKIT_UINT8(2);
-                homekit_characteristic_notify(&position_state, position_state.value);
+                movement_stop(false);
                 pix_state = PIX_STOPPED;
         }
         hold_position.value = HOMEKIT_BOOL(false); // auto-reset to false
@@ -417,11 +433,7 @@ static int64_t calib_start_us = 0;
 
 static void calib_enter(void) {
         if (calib_state != CAL_IDLE) return;
-        if (move_task_handle) {
-                vTaskDelete(move_task_handle);
-                move_task_handle = NULL;
-        }
-        movement_finalize();
+        movement_stop(false);
         ESP_LOGI("CAL", "Calibration MODE ON: set shade fully CLOSED, press OPEN to start timing, press STOP when fully OPEN.");
         calib_state = CAL_ARMED;
         pix_state = PIX_CALIBRATING;
@@ -442,11 +454,7 @@ static void calib_start_run(void) {
         calib_start_us = esp_timer_get_time();
         calib_state = CAL_RUNNING;
         // Force fully open movement without altering HomeKit target
-        if (move_task_handle) {
-                vTaskDelete(move_task_handle);
-                move_task_handle = NULL;
-                movement_finalize();
-        }
+        movement_stop(false);
         position_state.value = HOMEKIT_UINT8(1);
         homekit_characteristic_notify(&position_state, position_state.value);
         motor_drive_open(true);
