@@ -1,5 +1,5 @@
 /**
-   Copyright 2025 Achim Pieters | StudioPieters®
+   Copyright 2026 Achim Pieters | StudioPieters®
 
    Permission is hereby granted, free of charge, to any person obtaining a copy
    of this software and associated documentation files (the "Software"), to deal
@@ -20,7 +20,7 @@
 
    for more information visit https://www.studiopieters.nl
  **/
- 
+
 #include <string.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -119,7 +119,11 @@ static esp_err_t nvs_load_wifi(char **out_ssid, char **out_pass) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open("wifi_cfg", NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(WIFI_TAG, "NVS open failed for namespace 'wifi_cfg': %s", esp_err_to_name(err));
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(WIFI_TAG, "Wi-Fi credentials not provisioned yet (namespace 'wifi_cfg' missing)");
+        } else {
+            ESP_LOGE(WIFI_TAG, "NVS open failed for namespace 'wifi_cfg': %s", esp_err_to_name(err));
+        }
         return err;
     }
 
@@ -127,7 +131,11 @@ static esp_err_t nvs_load_wifi(char **out_ssid, char **out_pass) {
     size_t len_pass = 0;
     err = nvs_get_str(handle, "wifi_ssid", NULL, &len_ssid);
     if (err != ESP_OK) {
-        ESP_LOGE(WIFI_TAG, "NVS key 'wifi_ssid' not found: %s", esp_err_to_name(err));
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(WIFI_TAG, "Wi-Fi credentials not provisioned yet (key 'wifi_ssid' missing)");
+        } else {
+            ESP_LOGE(WIFI_TAG, "NVS key 'wifi_ssid' read error: %s", esp_err_to_name(err));
+        }
         nvs_close(handle);
         return err;
     }
