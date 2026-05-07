@@ -1,27 +1,77 @@
 menu "StudioPieters"
 
-      config ESP_LED_GPIO
-              int "Set the GPIO for the LED"
-              default 2
-              help
-                  The GPIO number the LED is connected to.
+    config ESP_LED_GPIO
+        int "Identify LED GPIO"
+        default 23
+        help
+            GPIO for the HomeKit identify LED. Blinks on HomeKit identify
+            request. Not exposed as a HomeKit service.
 
-      config ESP_BUTTON_GPIO
-              int "Button GPIO"
-              default 9
-              help
-                  GPIO van de knop (actief laag als je button_config_default(button_active_low) gebruikt).
+    config ESP_BUTTON_GPIO
+        int "Physical button GPIO"
+        default 25
+        help
+            GPIO for the physical push button wired GND -> button -> GPIO.
+            Uses active-low logic. Avoid bootstrapping pins (0, 2, 5, 12, 15).
+            Single press: OTA update/reboot.
+            Double press: HomeKit reset + restart.
+            Long press: factory reset + reboot.
 
-      config ESP_SETUP_CODE
-              string "HomeKit Setup Code"
-              default "338-77-883"
-              help
-                  If you want to change the HomeKit Setup Code, you can do that here (Note:  you need to make a new QR-CODE To make it work)
+    config ESP_RELAY_OPEN_GPIO
+        int "OPEN (UP) relay GPIO"
+        default 16
+        help
+            GPIO driving the relay that opens / raises the sunshade.
+            Never activated simultaneously with the CLOSE relay (software interlock).
 
-      config ESP_SETUP_ID
-              string "HomeKit Setup ID"
-              default "1QJ8"
-              help
-                   If you want to change the HomeKit Setup ID, you can do that here (Note: you need to make a new QR-CODE To make it work)
+    config ESP_RELAY_CLOSE_GPIO
+        int "CLOSE (DOWN) relay GPIO"
+        default 17
+        help
+            GPIO driving the relay that closes / lowers the sunshade.
+            Never activated simultaneously with the OPEN relay (software interlock).
+
+    config ESP_TOUCH_UP_GPIO
+        int "Touch UP GPIO (T9)"
+        default 32
+        help
+            Capacitive touch GPIO for the UP button (GPIO32 = touch channel T9).
+            Activates sunshade open.
+
+    config ESP_TOUCH_STOP_GPIO
+        int "Touch STOP GPIO (T8)"
+        default 33
+        help
+            Capacitive touch GPIO for the STOP button (GPIO33 = touch channel T8).
+            Immediately stops all movement.
+
+    config ESP_TOUCH_DOWN_GPIO
+        int "Touch DOWN GPIO (T7)"
+        default 27
+        help
+            Capacitive touch GPIO for the DOWN button (GPIO27 = touch channel T7).
+            Activates sunshade close.
+
+    config SUNSHADE_FULL_TRAVEL_TIME_MS
+        int "Full travel time (ms)"
+        default 20000
+        range 1000 120000
+        help
+            Time in milliseconds for the sunshade motor to travel the full
+            distance from 0 % (fully closed) to 100 % (fully open), or vice
+            versa. Used for time-based position estimation (no limit switches).
+            Measure your motor and set this value accordingly.
+
+    config ESP_SETUP_CODE
+        string "HomeKit Setup Code"
+        default "582-94-633"
+        help
+            HomeKit pairing code. Changing this value requires a new QR code.
+
+    config ESP_SETUP_ID
+        string "HomeKit Setup ID"
+        default "7MX2"
+        help
+            HomeKit setup ID. Changing this value requires a new QR code.
 
 endmenu

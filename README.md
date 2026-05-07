@@ -1,210 +1,419 @@
-# Lifecycle Manager LED Example
+# HomeKit Sunshade – ESP32-WROOM-32D
 
-This folder contains a complete HomeKit LED accessory that uses the **Lifecycle Manager (LCM)**. The guide below walks you step by step through converting the original demo (without LCM) into the new LCM-enabled version. It is written for beginners: for every section you learn what to add, why it matters, and what it does.
+A complete **Apple HomeKit Window Covering** accessory for the ESP32-WROOM-32D built with ESP-IDF v5.  
+It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive touch buttons, time-based position tracking, calibration, and automatic power-loss recovery.
 
-## 1. Understand the basics
+---
 
-| Component | Without LCM | With LCM |
-|-----------|-------------|----------|
-| Wi-Fi management | Manually handle every Wi-Fi event yourself. | Call `wifi_start()` from the LCM to start Wi-Fi and reconnect automatically. |
-| Storage | Initialize and reset NVS manually. | `lifecycle_nvs_init()` performs the setup and logs the reset state. |
-| OTA updates & firmware versions | Not available. | The LCM exposes an OTA trigger and reads the firmware version from NVS. |
-| Restore/reset | Reset manually through HomeKit. | Use lifecycle functions for updates, factory resets, and the automatic reboot counter. |
+## Table of Contents
 
-The rest of this document shows how to update the old code to the new version, with an explanation at each step.
+1. [Feature overview](#1-feature-overview)
+2. [Hardware](#2-hardware)
+3. [GPIO pinout](#3-gpio-pinout)
+4. [Build and flash](#4-build-and-flash)
+5. [First-time setup](#5-first-time-setup)
+6. [Calibration procedure](#6-calibration-procedure)
+7. [Power-loss recovery](#7-power-loss-recovery)
+8. [HomeKit position control](#8-homekit-position-control)
+9. [Touch buttons](#9-touch-buttons)
+10. [Physical button](#10-physical-button)
+11. [Identify LED](#11-identify-led)
+12. [OTA updates](#12-ota-updates)
+13. [Menuconfig reference](#13-menuconfig-reference)
+14. [NVS storage layout](#14-nvs-storage-layout)
+15. [How position tracking works](#15-how-position-tracking-works)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Requirements](#17-requirements)
 
-## 2. Include the headers
+---
 
-**Why:** The LCM and the button library provide ready-to-use functions. Import the right headers to access them.
+## 1. Feature overview
 
-```c
-#include "esp32-lcm.h"   // pull in the Lifecycle Manager
-#include <button.h>       // button events without extra boilerplate
-```
+| Feature | Details |
+|---------|---------|
+| **HomeKit service** | `WINDOW_COVERING` – current position, target position, position state |
+| **Accessory category** | Window Covering (tile icon in the Home app) |
+| **Relay outputs** | GPIO16 (OPEN/UP), GPIO17 (CLOSE/DOWN) with software interlock |
+| **Touch buttons** | Capacitive: UP (GPIO32/T9), STOP (GPIO33/T8), DOWN (GPIO27/T7) |
+| **Physical button** | Push button on GPIO25: single/double/long press |
+| **Identify LED** | GPIO23 – blinks on HomeKit Identify, not visible as a service |
+| **Calibration** | Measures actual motor travel time; saved to NVS flash |
+| **Power-loss recovery** | On boot: closes fully, then restores last HomeKit position |
+| **Position tracking** | Time-based, 0–100 %, updated every 200 ms |
+| **OTA** | Firmware update via HomeKit custom characteristic or single button press |
+| **Lifecycle Manager** | WiFi, NVS, factory reset, reboot counter via `esp32-lcm` |
 
-**What it does:**
-- `esp32-lcm.h` gives you the lifecycle, OTA, and Wi-Fi helper functions.
-- `button.h` makes it easy to detect single, double, and long presses.
+---
 
-Do not forget to use the `CONFIG_ESP_BUTTON_GPIO` macro so the button pin can be set through `menuconfig`.
+## 2. Hardware
 
-## 3. Extend the HomeKit characteristics
+### Required components
 
-**Why:** The LCM manages the firmware version and exposes a default OTA trigger. Add these characteristics to HomeKit so you can use them from the Home app.
+| Component | Quantity | Notes |
+|-----------|----------|-------|
+| ESP32-WROOM-32D | 1 | Any ESP32 module with sufficient GPIOs |
+| Relay module (2-channel) | 1 | One relay per direction; optoisolated recommended |
+| Copper ring / touch pad | 3 | UP, STOP, DOWN – with shielded cable and ground shield |
+| Push button (momentary) | 1 | NO type, wired GND → button → GPIO25 |
+| LED + current-limiting resistor | 1 | Identify LED on GPIO23 |
 
-Replace the manual firmware version with the LCM constant and add the OTA trigger:
+### Schematic
 
-```c
-homekit_characteristic_t revision =
-    HOMEKIT_CHARACTERISTIC_(FIRMWARE_REVISION, LIFECYCLE_DEFAULT_FW_VERSION);
-homekit_characteristic_t ota_trigger = API_OTA_TRIGGER;
-```
+![HomeKit Sunshade schematic](scheme.png)
 
-Then add `&ota_trigger` to the Lightbulb service. This allows you to start an update from the Home app without pressing a hardware button.
+### Relay wiring
 
-## 4. Initialize the lifecycle in `app_main`
-
-**Why:** The LCM tracks the device state (reboot counter, firmware version, HomeKit data). Without this initialization the lifecycle features do not work.
-
-```c
-ESP_ERROR_CHECK(lifecycle_nvs_init());
-lifecycle_log_post_reset_state("INFORMATION");
-ESP_ERROR_CHECK(
-    lifecycle_configure_homekit(&revision, &ota_trigger, "INFORMATION"));
-```
-
-**What it does:**
-- `lifecycle_nvs_init()` initializes NVS and prepares the lifecycle tables.
-- `lifecycle_log_post_reset_state()` logs whether you booted after a brownout, crash, etc.
-- `lifecycle_configure_homekit()` links the OTA trigger and firmware version to HomeKit.
-
-## 5. Let the LCM start Wi-Fi
-
-**Why:** In the old code you had to register events and call `esp_wifi_*` functions manually. The LCM handles this and takes provisioning into account.
-
-```c
-esp_err_t wifi_err = wifi_start(on_wifi_ready);
-```
-
-**What it does:**
-- Starts Wi-Fi in station mode automatically.
-- Calls `on_wifi_ready()` when the connection is established.
-- Makes it clear whether provisioning is still required (`ESP_ERR_NVS_NOT_FOUND`).
-
-## 6. Buttons for updates and factory reset
-
-**Why:** Hardware buttons can now trigger OTA updates or factory resets without writing your own timers and debouncing code.
-
-```c
-button_config_t btn_cfg = button_config_default(button_active_low);
-btn_cfg.max_repeat_presses = 3;
-btn_cfg.long_press_time = 1000;
-
-if (button_create(BUTTON_GPIO, btn_cfg, button_callback, NULL)) {
-    ESP_LOGE("BUTTON", "Failed to initialize button");
-}
-```
-
-Handle the different events in the callback:
-
-```c
-void button_callback(button_event_t event, void *context) {
-    switch (event) {
-    case button_event_single_press:
-        lifecycle_request_update_and_reboot();
-        break;
-    case button_event_double_press:
-        homekit_server_reset();
-        esp_restart();
-        break;
-    case button_event_long_press:
-        lifecycle_factory_reset_and_reboot();
-        break;
-    }
-}
-```
-
-**What it does:**
-- **Single press:** requests an OTA update from the LCM and restarts afterwards.
-- **Double press:** resets the HomeKit pairing.
-- **Long press:** performs a full factory reset (Wi-Fi and HomeKit included).
-
-## 7. LED control and HomeKit logic
-
-The core LED helpers (`gpio_init`, `led_write`, `led_on_set`) stay almost the same. Add extra `ESP_LOGI` messages so the serial monitor shows when the LED toggles.
-
-## 8. Putting it all together
-
-Once you follow the steps above, the start of your file should look like this:
-
-```c
-#include "esp32-lcm.h"
-#include <button.h>
-
-#define BUTTON_GPIO CONFIG_ESP_BUTTON_GPIO
-#define LED_GPIO    CONFIG_ESP_LED_GPIO
-```
-
-And the `app_main` function:
-
-```c
-void app_main(void) {
-    ESP_ERROR_CHECK(lifecycle_nvs_init());
-    lifecycle_log_post_reset_state("INFORMATION");
-    ESP_ERROR_CHECK(lifecycle_configure_homekit(&revision, &ota_trigger,
-                                                "INFORMATION"));
-
-    gpio_init();
-
-    button_config_t btn_cfg = button_config_default(button_active_low);
-    btn_cfg.max_repeat_presses = 3;
-    btn_cfg.long_press_time = 1000;
-    if (button_create(BUTTON_GPIO, btn_cfg, button_callback, NULL)) {
-        ESP_LOGE("BUTTON", "Failed to initialize button");
-    }
-
-    esp_err_t wifi_err = wifi_start(on_wifi_ready);
-    if (wifi_err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW("WIFI", "WiFi configuration not found; provisioning required");
-    } else if (wifi_err != ESP_OK) {
-        ESP_LOGE("WIFI", "Failed to start WiFi: %s", esp_err_to_name(wifi_err));
-    }
-}
-```
-
-## 9. Expected behavior
-
-- **HomeKit characteristics** automatically show the correct firmware version.
-- **OTA** can be triggered from the Home app (Lifecycle service) or via the button (single press).
-- **Factory reset** is available through a long press or automatically after 10 quick restarts (configurable through `menuconfig`).
-- **Wi-Fi** starts automatically or requests provisioning if no credentials are stored.
-
-## 10. Wiring
-
-Connect the pins as described below (configurable via `menuconfig`):
-
-| Name | Description | Default |
-|------|-------------|---------|
-| `CONFIG_ESP_LED_GPIO` | GPIO for the LED | `2` |
-| `CONFIG_ESP_BUTTON_GPIO` | GPIO for the button | `9` |
-
-## 11. Schematic
-
-![HomeKit LED](https://github.com/AchimPieters/esp32-lifecycle-manager/blob/main/examples/led/scheme.png)
-
-## 12. Requirements
-
-- **idf version:** `>=5.0`
-- **espressif/mdns version:** `1.8.0`
-- **wolfssl/wolfssl version:** `5.7.6`
-- **achimpieters/esp32-homekit version:** `1.0.0`
-- **achimpieters/button version:** `1.2.3`
-
-## 13. Menuconfig tips
-
-- Set your GPIO numbers, Wi-Fi SSID, and password in the `StudioPieters` menu.
-- Adjust the `HomeKit Setup Code` and `Setup ID` if needed. Remember to generate a new QR code when you do.
-- Configure the reboot counter timeout in `Lifecycle Manager` to control automatic factory resets.
-
-By following these steps, you convert the original LED demo into a version that leverages the Lifecycle Manager. You gain OTA updates, consistent firmware information, and straightforward reset scenarios without complex extra code.
-
-
-## 14. Troubleshooting set-target
-
-If `idf.py set-target <chip>` prints this error:
+The two relay outputs switch the motor direction:
 
 ```
-Directory ".../build" doesn't seem to be a CMake build directory.
-Refusing to automatically delete files in this directory.
+OPEN relay (GPIO16) ──► motor terminal A power
+CLOSE relay (GPIO17) ──► motor terminal B power
+GND (common) ──────────► motor common
 ```
 
-remove the stale build folder once and re-run:
+> **Important:** Never wire OPEN and CLOSE to the same motor terminal simultaneously. The software interlock already prevents both relays from being energised at the same time, but double-check your wiring.
 
-```sh
+### Touch pad construction
+
+Each capacitive button consists of:
+- A **copper ring or pad** as the sensing electrode
+- A **shielded cable** (braid connected to GND) to prevent false positives from cable routing
+- A **ground plane** around the pad where possible
+
+The pads connect directly to the ESP32 touch channel pins. No additional components are needed.
+
+---
+
+## 3. GPIO pinout
+
+| GPIO | Function | Direction | Notes |
+|------|----------|-----------|-------|
+| **GPIO16** | OPEN / UP relay | Output | Active HIGH; motor runs UP |
+| **GPIO17** | CLOSE / DOWN relay | Output | Active HIGH; motor runs DOWN |
+| **GPIO23** | Identify LED | Output | Blinks on HomeKit Identify |
+| **GPIO25** | Physical push button | Input | GND → button → GPIO25; active-low |
+| **GPIO27** | Touch DOWN (T7) | Touch input | Capacitive; close/lower sunshade |
+| **GPIO32** | Touch UP (T9) | Touch input | Capacitive; open/raise sunshade |
+| **GPIO33** | Touch STOP (T8) | Touch input | Capacitive; stop + calibration trigger |
+
+All defaults are configurable via `idf.py menuconfig` → **StudioPieters**.
+
+---
+
+## 4. Build and flash
+
+```bash
+git clone https://github.com/AchimPieters/esp32-homekit-Sunshade.git
+cd esp32-homekit-Sunshade
+
+# Set target (once per checkout)
+idf.py set-target esp32
+
+# Optional: adjust GPIOs, travel time, HomeKit code
+idf.py menuconfig
+
+# Build, flash and monitor
+idf.py build flash monitor
+```
+
+> If `idf.py set-target` fails with a CMake error, remove the stale build folder first:
+> ```bash
+> rm -rf build && idf.py set-target esp32
+> ```
+
+### Provision WiFi
+
+On first boot, WiFi credentials are not stored. Use any ESP-IDF provisioning method (e.g. `esp-idf-prov` app on iOS/Android) to configure the SSID and password. The device will remember the credentials across reboots.
+
+---
+
+## 5. First-time setup
+
+1. **Flash** the firmware.
+2. **Provision WiFi** (see above).
+3. **Pair** with HomeKit using the QR code or the setup code printed in `menuconfig` (default: `582-94-633`).
+4. **Calibrate** the sunshade so the device learns how long your motor takes (see [Calibration procedure](#6-calibration-procedure)).
+5. After calibration, **HomeKit position control** (0–100 %) is active.
+
+---
+
+## 6. Calibration procedure
+
+Calibration teaches the device the actual travel time of your motor by measuring it directly. The result is stored in NVS flash and survives power loss.
+
+> **Trigger:** Hold the **STOP touch pad** for **3 seconds**.  
+> The LED starts blinking rapidly to confirm calibration mode has started.
+
+### Phase 1 – close to home position
+
+The motor runs **CLOSED** for `calibrated_time × 1.5`. This guarantees the sunshade reaches the physical end stop even if the stored time is slightly off. The motor stops itself at the end stop; the extra time is harmless.
+
+LED blinks **fast** (200 ms on/off) during this phase.
+
+### Phase 2 – open and measure
+
+The motor starts running **OPEN** and a timer counts the elapsed time.  
+LED blinks **slowly** (800 ms on/off).
+
+**Watch the sunshade. When it is fully open:**  
+→ Press the **STOP touch pad once** (quick tap).
+
+The elapsed time is saved to NVS as the calibrated travel time (`shade/cal_ms`).
+
+### Calibration success
+
+The LED blinks **5 times quickly**.  
+The sunshade is now at **100 %** (fully open). HomeKit is notified.  
+From this point on, all positions 0–100 % are available.
+
+### Calibration abort conditions
+
+| Situation | Result |
+|-----------|--------|
+| STOP pressed within 2 s of phase 2 start | Aborted; device stays at 0 % |
+| No STOP press within 2 minutes | Timeout; aborted; device stays at 0 % |
+
+If calibration is aborted, repeat the procedure.
+
+### Re-calibration
+
+To update the travel time (e.g. after motor replacement), simply trigger calibration again. The new value overwrites the stored one.
+
+---
+
+## 7. Power-loss recovery
+
+After every power loss the device does not know where the sunshade is.  
+If the device **has been calibrated**, it performs an automatic **homing sequence** on boot:
+
+```
+Boot
+ └─ Calibrated?
+     ├─ Yes → Homing task (background)
+     │         1. Run motor CLOSED for (cal_ms × 1.5)
+     │            Motor stops at physical end stop → position = 0 %
+     │         2. Wait 500 ms
+     │         3. Load last saved target position from NVS
+     │         4. Move to that position
+     │
+     └─ No  → Start normally; show warning in log
+               (hold STOP touch 3 s to calibrate)
+```
+
+The homing task runs **in the background** so WiFi and HomeKit initialise in parallel. Commands from HomeKit or the touch buttons are blocked while homing is in progress.
+
+### What is "last saved position"?
+
+Every time you command the sunshade to a new position (via HomeKit or touch buttons), the **target** position is saved to NVS (`shade/last_pos`). After a power loss, the device restores this value.
+
+**Example:**
+1. HomeKit commands 70 % → saved to NVS.
+2. Power fails while moving from 0 % to 70 % (sunshade is at ~40 %).
+3. On reboot: close fully → position = 0 % → move to 70 %.
+
+---
+
+## 8. HomeKit position control
+
+Once calibrated, the **Sun Screen** tile in the Home app supports:
+
+| Control | Result |
+|---------|--------|
+| Drag slider to 0 % | Close sunshade fully |
+| Drag slider to 100 % | Open sunshade fully |
+| Drag slider to 20–99 % | Move to that exact position |
+| Tap tile (toggle) | Fully open or fully close |
+
+### Position state
+
+The Home app shows the current movement direction:
+
+| HomeKit value | Meaning |
+|---------------|---------|
+| Decreasing | Closing |
+| Increasing | Opening |
+| Stopped | Motor off |
+
+### End-stop behaviour for 0 % and 100 %
+
+When the target is **0 %** or **100 %**, the motor runs for the full calibrated time. The motor's own mechanical end stop provides the final accuracy. HomeKit is notified of 0 % / 100 % when the timed run completes.
+
+### Intermediate positions (1–99 %)
+
+The motor runs for a calculated fraction of the calibrated time and stops via software. Accuracy depends on how close `cal_ms` is to the real travel time.
+
+---
+
+## 9. Touch buttons
+
+Three capacitive touch buttons made of copper rings with shielded cables:
+
+| Pad | GPIO | Touch channel | Action |
+|-----|------|---------------|--------|
+| UP | GPIO32 | T9 | Open sunshade to 100 % |
+| STOP | GPIO33 | T8 | Stop immediately (or confirm calibration) |
+| DOWN | GPIO27 | T7 | Close sunshade to 0 % |
+
+### Hold STOP for calibration
+
+| Duration | Action |
+|----------|--------|
+| Quick tap (< 3 s) | Stop motor or confirm calibration open |
+| Hold ≥ 3 s | Start calibration procedure |
+
+### Sensitivity
+
+Touch pads are calibrated at boot. The threshold is set at **70 %** of the baseline reading (configurable via `TOUCH_THRESHOLD_FACTOR` in `main.c`). Readings are filtered with a 10 ms IIR filter to suppress noise. Baseline values are logged at startup:
+
+```
+I (1234) TOUCH: Baselines – UP(T9/GPIO32):1024  STOP(T8/GPIO33):987  DOWN(T7/GPIO27):1103
+```
+
+If any baseline is below ~100, the pad is likely not connected or the shielding is insufficient.
+
+---
+
+## 10. Physical button
+
+Wire: **GND → button → GPIO25** (active-low, internal pull-up).
+
+| Press type | Action |
+|------------|--------|
+| **Single press** | Request OTA firmware update and reboot |
+| **Double press** | Reset HomeKit pairing + restart |
+| **Long press (≥ 1 s)** | Factory reset (WiFi + HomeKit) + reboot |
+
+The relays are turned off before any reset or reboot.
+
+---
+
+## 11. Identify LED
+
+GPIO23, active-high output.
+
+When HomeKit sends an **Identify** request (e.g. when adding the accessory), the LED blinks 3 × 2 pulses. The LED is **not** exposed as a HomeKit Lightbulb service.
+
+---
+
+## 12. OTA updates
+
+Two ways to trigger a firmware update:
+
+1. **Single press** on the physical button → `lifecycle_request_update_and_reboot()`
+2. **HomeKit** → toggle the custom OTA characteristic in the Window Covering service
+
+The Lifecycle Manager handles the update process and version tracking automatically.
+
+---
+
+## 13. Menuconfig reference
+
+Open with `idf.py menuconfig` → **StudioPieters**.
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `ESP_LED_GPIO` | 23 | GPIO for the identify LED |
+| `ESP_BUTTON_GPIO` | 25 | GPIO for the physical push button |
+| `ESP_RELAY_OPEN_GPIO` | 16 | GPIO for the OPEN/UP relay |
+| `ESP_RELAY_CLOSE_GPIO` | 17 | GPIO for the CLOSE/DOWN relay |
+| `ESP_TOUCH_UP_GPIO` | 32 | Touch UP pad (T9) – informational |
+| `ESP_TOUCH_STOP_GPIO` | 33 | Touch STOP pad (T8) – informational |
+| `ESP_TOUCH_DOWN_GPIO` | 27 | Touch DOWN pad (T7) – informational |
+| `SUNSHADE_FULL_TRAVEL_TIME_MS` | 20000 | Default travel time in ms (used before calibration) |
+| `ESP_SETUP_CODE` | 582-94-633 | HomeKit pairing code |
+| `ESP_SETUP_ID` | 7MX2 | HomeKit setup ID |
+
+> **Touch GPIO values** in Kconfig are documentation only. The touch channel numbers (`TOUCH_PAD_NUM7/8/9`) are hardcoded in `main.c` because the GPIO→Touch mapping is fixed in ESP32 silicon.
+
+> Changing `ESP_SETUP_CODE` or `ESP_SETUP_ID` requires a new QR code.
+
+---
+
+## 14. NVS storage layout
+
+| Namespace | Key | Type | Description |
+|-----------|-----|------|-------------|
+| `shade` | `cal_done` | u8 | `1` = device has been calibrated |
+| `shade` | `cal_ms` | u32 | Measured full travel time in milliseconds |
+| `shade` | `last_pos` | u8 | Last HomeKit target position (0–100) |
+
+The Lifecycle Manager uses a separate namespace for WiFi credentials and reboot counters.
+
+---
+
+## 15. How position tracking works
+
+The device uses **time-based position estimation** because there are no limit switches or encoders.
+
+```
+position_delta_per_tick = 100 % × 200 ms / cal_ms
+```
+
+Every 200 ms the movement task adds or subtracts this delta from the current position. When the target is reached, the relay is switched off and HomeKit is notified.
+
+### Accuracy
+
+- Accuracy depends directly on how well `cal_ms` matches your motor's actual travel time.
+- The motor's mechanical end stop corrects accumulated error every time the sunshade reaches 0 % or 100 %.
+- For intermediate positions, expect ±2–5 % error over many cycles without recalibration.
+
+### Direction change mid-travel
+
+If a new command arrives while the motor is running (e.g. stop at 60 % then move to 30 %), the task re-syncs its floating-point accumulator from `s_cur_pos` and immediately reflects the direction change. The relay interlock ensures the closing relay is always off before the opening relay is energised, and vice versa.
+
+---
+
+## 16. Troubleshooting
+
+### Sunshade does not respond to touch
+
+1. Check the log at boot for `TOUCH: Baselines`. If a value is 0 or very low, the pad is not connected.
+2. Verify shielded cable braids are connected to GND.
+3. Increase `TOUCH_THRESHOLD_FACTOR` (default 0.70) closer to 1.0 for a more sensitive threshold. Edit in `main.c`.
+
+### Calibration aborts immediately
+
+- STOP touch pad pressed within 2 seconds of phase 2 start → counts as premature.
+- Repeat calibration and wait until the sunshade is fully open before tapping STOP.
+
+### Position is wrong after several cycles
+
+Recalibrate. Measure the actual travel time with a stopwatch; if it differs significantly from `cal_ms`, the motor speed may vary with load or temperature.
+
+### HomeKit shows wrong position after power loss
+
+- Confirm the device is calibrated (`shade/cal_done = 1` in NVS).
+- The homing sequence is logged: `[SUNSHADE] Homing: closing fully...`. If not seen, calibration data may be missing.
+- If NVS is corrupted, perform a factory reset (long press button) and recalibrate.
+
+### Relay clicks but motor does not run
+
+- Check relay module power supply (some modules need 5 V even if the coil is driven by 3.3 V logic).
+- Verify the NO/COM wiring on the relay module.
+
+### WiFi will not connect
+
+- Double press the physical button to reset HomeKit pairing, then re-provision WiFi.
+- Long press the physical button for a full factory reset.
+
+### `idf.py set-target` CMake error
+
+```bash
 rm -rf build
-idf.py set-target esp32c3   # or your target
-# ESP32-C5/C6 on IDF 6.0 may require preview mode:
-# idf.py --preview set-target esp32c5
+idf.py set-target esp32
 ```
 
-This happens when `build/` exists but was not created by CMake (for example, after copying files between environments).
+---
+
+## 17. Requirements
+
+| Component | Version |
+|-----------|---------|
+| ESP-IDF | `>=5.0, <7.0` |
+| `achimpieters/esp32-homekit` | `>=3.0.0` |
+| `achimpieters/esp32-button` | `>=1.2.3` |
+| `espressif/mdns` | `>=1.8.0` |
+
+---
+
+*Copyright 2026 Achim Pieters | StudioPieters® – [studiopieters.nl](https://www.studiopieters.nl)*
