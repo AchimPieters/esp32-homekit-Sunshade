@@ -59,7 +59,7 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 
 ### Schematic
 
-![HomeKit Sunshade schematic](scheme.png)
+![HomeKit Sunshade schematic](scheme.jpg)
 
 ### Relay wiring
 
