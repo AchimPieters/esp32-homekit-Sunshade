@@ -1,5 +1,7 @@
 # HomeKit Sunshade – ESP32-WROOM-32D
 
+[![Build](https://github.com/AchimPieters/esp32-homekit-Sunshade/actions/workflows/build.yml/badge.svg)](https://github.com/AchimPieters/esp32-homekit-Sunshade/actions/workflows/build.yml)
+
 A complete **Apple HomeKit Window Covering** accessory for the ESP32-WROOM-32D built with ESP-IDF v5.  
 It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive touch buttons, time-based position tracking, calibration, and automatic power-loss recovery.
 
@@ -20,11 +22,12 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 11. [Identify LED](#11-identify-led)
 12. [OTA updates](#12-ota-updates)
 13. [Wind speed sensor (optional)](#13-wind-speed-sensor-optional)
-14. [Menuconfig reference](#14-menuconfig-reference)
-15. [NVS storage layout](#15-nvs-storage-layout)
-16. [How position tracking works](#16-how-position-tracking-works)
-17. [Troubleshooting](#17-troubleshooting)
-18. [Requirements](#18-requirements)
+14. [Rain sensor (optional)](#14-rain-sensor-optional)
+15. [Menuconfig reference](#15-menuconfig-reference)
+16. [NVS storage layout](#16-nvs-storage-layout)
+17. [How position tracking works](#17-how-position-tracking-works)
+18. [Troubleshooting](#18-troubleshooting)
+19. [Requirements](#19-requirements)
 
 ---
 
@@ -316,26 +319,25 @@ Enable via `idf.py menuconfig` → **StudioPieters** → **Wind Speed Sensor**.
 
 | Property | Value |
 |----------|-------|
-| Model | HWFS-1 |
+| Model | HWFS-1 (0–3.3 V version) |
 | Power | **Passive — no external VCC needed** (self-powered by rotation) |
-| Output | 0–4 V analog, DC generator |
-| Manufacturer formula | `V_out × 14 = m/s` (4 V = 56 m/s) |
-| **Empirical formula** | **`V_out × 2.58 = m/s`** (4 V ≈ 10.3 m/s at low wind speeds) |
+| Output | 0–3.3 V analog, DC generator |
+| Full scale | 3.3 V = **14 m/s** (manufacturer stated) |
+| Conversion | `wind speed (m/s) = V_out × (14 / 3.3) ≈ V_out × 4.24` |
 | Resting offset | ~33 mV at 0 m/s (not true 0 V) |
-| Accuracy | ±10 % (manufacturer); nonlinear below ~2 m/s |
+| Accuracy | ±10 % (manufacturer); nonlinear at very low RPM |
 | Cable | 2 conductors: signal (black + stripe) + GND (solid black) |
 
-> **Important — manufacturer formula is wrong at sunshade-relevant speeds.**  
-> The HWFS-1 uses a small DC permanent-magnet generator. At low RPM, cogging torque and brush friction introduce significant nonlinearity. Field tests against calibrated reference meters show the manufacturer's V × 14 factor overestimates by **5–6×** at 2–8 m/s. The empirically derived factor is V × 2.58, giving 10.3 m/s at 4 V. The firmware default (`WIND_SENSOR_MAX_SPEED_DS = 103`) uses this corrected value. Always verify against a reference instrument and adjust if needed.
+> The HWFS-1 uses a small DC permanent-magnet generator. At very low RPM, cogging torque and brush friction cause nonlinearity. For sunshade protection (thresholds at 5–8 m/s), the sensor is well within its operating range. Calibrate against a reference instrument and adjust `WIND_SENSOR_MAX_SPEED_DS` if needed.
 
 ### Wiring
 
-The sensor output reaches 4 V which exceeds the ESP32's 3.3 V ADC maximum. A voltage divider is required. Use **R1 = 10 kΩ + R2 = 15 kΩ** to stay within the ESP32 ADC accurate range (150–2450 mV with `ADC_ATTEN_DB_11`).
+The sensor output reaches 4 V which exceeds the ESP32's 3.3 V ADC maximum. A voltage divider is required. Although the sensor output (3.3 V max) matches the ESP32 supply voltage, the ADC is only accurate up to **2450 mV** with `ADC_ATTEN_DB_11`. Use **R1 = 10 kΩ + R2 = 22 kΩ** to stay within that range.
 
 ```
 HWFS-1 signal wire (black+stripe)
          │
-         ├── R1 (10 kΩ) ──┬── R2 (15 kΩ) ──► GND
+         ├── R1 (10 kΩ) ──┬── R2 (22 kΩ) ──► GND
          │                │
          │          (optional RC filter:
          │           10 kΩ + 10 µF to GND,
@@ -346,14 +348,12 @@ HWFS-1 signal wire (black+stripe)
 HWFS-1 ground wire (solid black) ──► GND
 ```
 
-At 4 V sensor output: V_ADC = 4.0 × 15 / (10 + 15) = **2.40 V** ✓ (within 2450 mV limit)  
-At 8 m/s empirical: V_sensor ≈ 8 / 2.58 = 3.1 V → V_ADC = **1.86 V** ✓
+At 3.3 V sensor output (14 m/s): V_ADC = 3.3 × 22 / (10 + 22) = **2.27 V** ✓ (within 2450 mV limit)  
+At 8.0 m/s: V_sensor = 8 / 14 × 3.3 = 1.89 V → V_ADC = 1.89 × 22/32 = **1.30 V** ✓
 
 > No VCC connection is needed. The HWFS-1 generates its own signal voltage from wind rotation.
 
 > Only ADC1 GPIOs (GPIO32–39) are supported. ADC2 conflicts with WiFi.
-
-> Avoid R2 = 22 kΩ (gives 2.75 V at 4 V input — above the 2450 mV accurate ADC range).
 
 ### Conversion formula
 
@@ -363,13 +363,13 @@ The firmware uses a linear mapping:
 speed (m/s) = (V_ADC / V_ADC_fullscale) × MAX_SPEED_DS / 10
 ```
 
-With the defaults (R1=10k/R2=15k, `WIND_SENSOR_ADC_FULL_SCALE_MV = 2400`, `WIND_SENSOR_MAX_SPEED_DS = 103`):
+With the defaults (R1=10k/R2=22k, `WIND_SENSOR_ADC_FULL_SCALE_MV = 2270`, `WIND_SENSOR_MAX_SPEED_DS = 140`):
 
 ```
-speed (m/s) ≈ V_out × 2.58    (empirical, for 2–10 m/s range)
+speed (m/s) = V_out × (14 / 3.3) ≈ V_out × 4.24
 ```
 
-The resting offset (~20 mV at the ADC pin after divider) is masked — readings at or below 30 mV are reported as 0 m/s.
+The resting offset (~23 mV at the ADC pin after divider) is masked — readings at or below 30 mV are reported as 0 m/s.
 
 ### ADC noise and DC generator ripple
 
@@ -398,7 +398,61 @@ The hysteresis gap (3 m/s by default) prevents rapid cycling when wind hovers ne
 
 ---
 
-## 14. Menuconfig reference  
+## 14. Rain sensor (optional) — MH-RD
+
+A digital rain sensor module can automatically close the sunshade when it starts raining and restore the previous position when it stops.
+
+Enable via `idf.py menuconfig` → **StudioPieters** → **Rain Sensor**.
+
+### Sensor characteristics
+
+| Property | Value |
+|----------|-------|
+| Module | MH-RD (LM393 comparator) |
+| Power | VCC = 3.3 V, GND = GND |
+| Output used | **DO** (digital output) — active-low when rain detected |
+| Output unused | AO (analog output) — not connected |
+| Sensitivity | Adjustable via onboard potentiometer |
+| Lifespan outdoors | Mount in sheltered position; sensing pad corrodes when permanently exposed |
+
+### Wiring
+
+```
+MH-RD module
+    VCC ──► 3.3 V
+    GND ──► GND
+    DO  ──► ESP32 GPIO35
+    AO     (not connected)
+```
+
+> Only the **DO** pin is used. The **AO** (analog) pin is not connected.
+
+### Behaviour
+
+| Condition | Action |
+|-----------|--------|
+| Rain detected (DO stable for **2 s**) | Sunshade closes; previous target position is saved |
+| Rain stopped (DO stable for **2 s**) | Sunshade restores to the saved position |
+
+The 2-second debounce prevents false triggers from brief drizzle or sensor noise. Adjust `RAIN_SENSOR_DEBOUNCE_MS` in menuconfig if needed.
+
+### Menuconfig keys
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `RAIN_SENSOR_ENABLE` | n | Enable MH-RD rain sensor |
+| `RAIN_SENSOR_GPIO` | 35 | GPIO connected to the DO pin |
+| `RAIN_SENSOR_ACTIVE_LEVEL` | 0 | 0 = active-low (default); 1 = active-high |
+| `RAIN_SENSOR_POLL_MS` | 500 | Poll interval in ms |
+| `RAIN_SENSOR_DEBOUNCE_MS` | 2000 | Stable time before acting on state change (ms) |
+
+### Installation tip
+
+Mount the sensing pad under a sheltered overhang so only falling rain reaches it — not condensation, irrigation spray, or splashing. This significantly extends pad lifespan and reduces false triggers.
+
+---
+
+## 15. Menuconfig reference  
 
 Open with `idf.py menuconfig` → **StudioPieters**.
 
@@ -426,15 +480,15 @@ Open with `idf.py menuconfig` → **StudioPieters**.
 |------------|---------|-------------|
 | `WIND_SENSOR_ENABLE` | n | Enable HWFS-1 wind speed sensor |
 | `WIND_SENSOR_ADC_GPIO` | 34 | ADC1 GPIO for signal wire (after voltage divider) |
-| `WIND_SENSOR_ADC_FULL_SCALE_MV` | **2400** | ADC voltage (mV) at sensor full-scale (4 V → 2400 mV with R1=10k/R2=15k) |
-| `WIND_SENSOR_MAX_SPEED_DS` | **103** | Full-scale wind speed in dm/s (103 = 10.3 m/s, empirical V×2.58; manufacturer V×14 = 560 — do not use) |
+| `WIND_SENSOR_ADC_FULL_SCALE_MV` | **2270** | ADC voltage (mV) at sensor full-scale (3.3 V → 2270 mV with R1=10k/R2=22k) |
+| `WIND_SENSOR_MAX_SPEED_DS` | **140** | Full-scale wind speed in dm/s (140 = 14.0 m/s, HWFS-1 0–3.3 V version) |
 | `WIND_SENSOR_CLOSE_THRESHOLD_DS` | 80 | Close threshold in dm/s (80 = 8.0 m/s, Beaufort 5) |
 | `WIND_SENSOR_REOPEN_THRESHOLD_DS` | 50 | Reopen hysteresis in dm/s (50 = 5.0 m/s) |
 | `WIND_SENSOR_POLL_MS` | 2000 | ADC sample interval in ms |
 
 ---
 
-## 15. NVS storage layout
+## 16. NVS storage layout
 
 | Namespace | Key | Type | Description |
 |-----------|-----|------|-------------|
@@ -446,7 +500,7 @@ The Lifecycle Manager uses a separate namespace for WiFi credentials and reboot 
 
 ---
 
-## 16. How position tracking works
+## 17. How position tracking works
 
 The device uses **time-based position estimation** because there are no limit switches or encoders.
 
@@ -468,7 +522,7 @@ If a new command arrives while the motor is running (e.g. stop at 60 % then move
 
 ---
 
-## 17. Troubleshooting
+## 18. Troubleshooting
 
 ### Sunshade does not respond to touch
 
@@ -516,6 +570,20 @@ Recalibrate. Measure the actual travel time with a stopwatch; if it differs sign
 - Lower `WIND_SENSOR_CLOSE_THRESHOLD_DS` in menuconfig.
 - The HWFS-1 is self-powered — no supply voltage is needed. Verify only signal and GND are connected.
 
+### Rain sensor does not trigger
+
+1. Confirm `RAIN_SENSOR_ENABLE = y` in menuconfig.
+2. Check `RAIN: MH-RD ready:` in the boot log. If absent, the task failed to start.
+3. Measure the DO pin with a multimeter while wetting the sensing pad. It should switch between ~0 V (rain) and ~3.3 V (dry) for active-low mode.
+4. Adjust the onboard potentiometer clockwise to increase sensitivity.
+5. If the sunshade does not close after rain starts, increase `RAIN_SENSOR_DEBOUNCE_MS` to filter noise, or decrease it if the response is too slow.
+
+### Sunshade closes unexpectedly (false rain trigger)
+
+- Mount the sensing pad in a sheltered position away from condensation and irrigation spray.
+- Increase `RAIN_SENSOR_DEBOUNCE_MS` (default 2000 ms) to require longer stable detection.
+- Turn the potentiometer counter-clockwise to reduce sensitivity.
+
 ### `idf.py set-target` CMake error
 
 ```bash
@@ -525,7 +593,7 @@ idf.py set-target esp32
 
 ---
 
-## 18. Requirements
+## 19. Requirements
 
 | Component | Version |
 |-----------|---------|

@@ -118,31 +118,30 @@ menu "StudioPieters"
 
         config WIND_SENSOR_ADC_FULL_SCALE_MV
             int "ADC voltage at sensor full-scale output (mV)"
-            default 2400
+            default 2270
             range 100 3300
             depends on WIND_SENSOR_ENABLE
             help
-                ADC input voltage (mV) when the sensor outputs its maximum 4 V.
+                ADC input voltage (mV) when the sensor outputs its maximum voltage.
                 ESP32 ADC_ATTEN_DB_11 accurate range: 150–2450 mV.
-                Recommended divider to stay within that range:
-                  R1=10 kΩ + R2=15 kΩ → 4000 × 15/25 = 2400 mV (default, safe).
-                  R1=10 kΩ + R2=22 kΩ → 4000 × 22/32 = 2750 mV (too high, avoid).
-                Change only if you use a different resistor ratio.
+                For the HWFS-1 0–3.3 V version:
+                  R1=10 kΩ + R2=22 kΩ → 3300 × 22/32 = 2269 mV ≈ 2270 mV (default, safe).
+                For a 0–4 V sensor:
+                  R1=10 kΩ + R2=15 kΩ → 4000 × 15/25 = 2400 mV.
+                Change only if you use a different resistor ratio or sensor output range.
 
         config WIND_SENSOR_MAX_SPEED_DS
             int "Wind speed at ADC full scale (dm/s, 1 dm/s = 0.1 m/s)"
-            default 103
+            default 140
             range 10 1000
             depends on WIND_SENSOR_ENABLE
             help
-                WARNING: The manufacturer publishes V×14=m/s (560 dm/s at 4 V).
-                Field tests against a calibrated reference meter show this formula
-                overestimates by 5–6× at low wind speeds. The empirically derived
-                factor is V×2.58=m/s: at 4 V → 10.3 m/s = 103 dm/s (default).
-                The HWFS-1 uses a DC generator whose V-vs-speed curve is nonlinear,
-                especially below 5 m/s (cogging torque). Calibrate against a
-                reference instrument and adjust this value accordingly.
-                Manufacturer value (unverified at high speeds): 560.
+                Wind speed (in dm/s) at the sensor's maximum output voltage.
+                For the HWFS-1 0–3.3 V version: full scale = 14 m/s = 140 dm/s (default).
+                The HWFS-1 uses a DC generator whose V-vs-speed curve is nonlinear
+                at very low RPM (cogging torque, brush friction). Calibrate against
+                a reference instrument and adjust this value if readings differ.
+                Previous 0–4 V HWFS-1 empirical value: 103 dm/s (V×2.58=m/s).
 
         config WIND_SENSOR_CLOSE_THRESHOLD_DS
             int "Auto-close threshold (dm/s)"
@@ -174,6 +173,58 @@ menu "StudioPieters"
                 Interval between wind speed readings. Each reading averages 16 ADC
                 samples internally to reduce commutator ripple and brush noise.
                 2000 ms is a good default; cup anemometers respond within 1–3 s.
+
+    endmenu
+
+    menu "Rain Sensor (optional)"
+
+        config RAIN_SENSOR_ENABLE
+            bool "Enable rain sensor (MH-RD)"
+            default n
+            help
+                Enable a digital rain sensor module (MH-RD or compatible FC-37/YL-83).
+                When rain is detected the sunshade closes automatically and restores
+                its previous position when rain stops.
+                Wiring: VCC → 3.3 V, GND → GND, DO → GPIO (AO not used).
+                Sensitivity is adjustable via the onboard potentiometer.
+
+        config RAIN_SENSOR_GPIO
+            int "Rain sensor digital output GPIO"
+            default 35
+            depends on RAIN_SENSOR_ENABLE
+            help
+                GPIO connected to the sensor module's DO (digital output) pin.
+                GPIO35 is input-only and is the recommended choice.
+                Avoid bootstrapping pins (0, 2, 5, 12, 15).
+
+        config RAIN_SENSOR_ACTIVE_LEVEL
+            int "Rain sensor active level"
+            default 0
+            range 0 1
+            depends on RAIN_SENSOR_ENABLE
+            help
+                Level of the DO pin when rain is detected.
+                0 = active-low (default — most FC-37/YL-83 modules with LM393).
+                1 = active-high (uncommon; check your module datasheet).
+
+        config RAIN_SENSOR_POLL_MS
+            int "Rain sensor poll interval (ms)"
+            default 500
+            range 100 5000
+            depends on RAIN_SENSOR_ENABLE
+            help
+                Interval between digital reads of the DO pin.
+                500 ms is a good default for rain detection.
+
+        config RAIN_SENSOR_DEBOUNCE_MS
+            int "Rain sensor debounce time (ms)"
+            default 2000
+            range 500 30000
+            depends on RAIN_SENSOR_ENABLE
+            help
+                The DO pin must remain stable for this long before a state change
+                is acted upon. 2000 ms prevents false triggers from brief drizzle
+                or sensor noise. Applies to both rain-start and rain-stop events.
 
     endmenu
 

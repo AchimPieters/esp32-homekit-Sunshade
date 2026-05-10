@@ -59,6 +59,8 @@
 #include <esp_adc/adc_oneshot.h>
 #endif
 
+// rain sensor uses only GPIO — no extra include needed
+
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
 
@@ -104,6 +106,14 @@
 #define WIND_POLL_MS             CONFIG_WIND_SENSOR_POLL_MS
 #endif
 
+// ── Rain sensor (optional) ────────────────────────────────────────────────────
+#ifdef CONFIG_RAIN_SENSOR_ENABLE
+#define RAIN_GPIO          CONFIG_RAIN_SENSOR_GPIO
+#define RAIN_ACTIVE_LEVEL  CONFIG_RAIN_SENSOR_ACTIVE_LEVEL
+#define RAIN_POLL_MS       CONFIG_RAIN_SENSOR_POLL_MS
+#define RAIN_DEBOUNCE_MS   CONFIG_RAIN_SENSOR_DEBOUNCE_MS
+#endif
+
 // ── Log tags ──────────────────────────────────────────────────────────────────
 static const char *TAG        = "SUNSHADE";
 static const char *TAG_TOUCH  = "TTP223";
@@ -113,6 +123,9 @@ static const char *TAG_CAL    = "CAL";
 static const char *TAG_NVS    = "NVS";
 #ifdef CONFIG_WIND_SENSOR_ENABLE
 static const char *TAG_WIND   = "WIND";
+#endif
+#ifdef CONFIG_RAIN_SENSOR_ENABLE
+static const char *TAG_RAIN   = "RAIN";
 #endif
 
 // ── Motion state ──────────────────────────────────────────────────────────────
@@ -147,6 +160,12 @@ static volatile bool        s_cal_success = false;
 #ifdef CONFIG_WIND_SENSOR_ENABLE
 static volatile bool s_wind_closed    = false;
 static volatile int  s_wind_saved_pos = 0;
+#endif
+
+// ── Rain protection state ─────────────────────────────────────────────────────
+#ifdef CONFIG_RAIN_SENSOR_ENABLE
+static volatile bool s_rain_closed    = false;
+static volatile int  s_rain_saved_pos = 0;
 #endif
 
 // ── Forward declarations ───────────────────────────────────────────────────────
@@ -1060,18 +1079,16 @@ static void on_wifi_ready(void) {
  *            The rotating cups drive a small DC generator in the base.
  *            Wiring: signal wire (black+stripe) and ground wire (solid black) only.
  *
- * OUTPUT:    0–4 V DC analog. Max safe ESP32 ADC input is 3.6 V → voltage divider
- *            is mandatory. Use R1=10 kΩ + R2=15 kΩ for 2.4 V max at ADC pin,
- *            keeping within ESP32 ADC_ATTEN_DB_11 accurate range (150–2450 mV).
+ * OUTPUT:    0–3.3 V DC analog (HWFS-1 3.3 V version). Max output = 14 m/s.
+ *            Although 3.3 V matches ESP32 Vcc, the ADC_ATTEN_DB_11 accurate range
+ *            is only 150–2450 mV. Use R1=10 kΩ + R2=22 kΩ to bring 3.3 V down
+ *            to 2.27 V, safely within the accurate range.
  *
- * FORMULA:   Manufacturer publishes V × 14 = m/s (4 V = 56 m/s).
- *            Field test against calibrated reference meter (DFRobot community,
- *            2024) showed V × 14 overestimates by 5–6× at low wind speeds.
- *            Empirically derived factor at 2–3 m/s: V × 2.58 = m/s.
- *            The discrepancy is caused by DC generator nonlinearity (cogging
- *            torque, brush friction) which is worst at low RPM.
- *            Default Kconfig WIND_SENSOR_MAX_SPEED_DS = 103 reflects V × 2.58.
- *            Calibrate against a reference instrument and adjust.
+ * FORMULA:   3.3 V = 14 m/s (manufacturer stated, linear).
+ *            The HWFS-1 uses a DC generator; output is nonlinear at very low RPM
+ *            (cogging torque, brush friction). Calibrate against a reference meter
+ *            and adjust WIND_SENSOR_MAX_SPEED_DS if readings are off.
+ *            Default Kconfig WIND_SENSOR_MAX_SPEED_DS = 140 (14.0 m/s).
  *
  * NOISE:     DC commutator generates ripple voltage. Cogging creates step-wise
  *            output near startup threshold. Hardware: place 10 kΩ + 10 µF RC
@@ -1091,8 +1108,8 @@ static void on_wifi_ready(void) {
 // ADC_ATTEN_DB_11 full-scale approximation (mV). Actual varies ±5% per chip.
 #define WIND_ADC_ATTEN_FS_MV  2450
 
-// Sensor resting offset at the ADC pin with R1=10k/R2=15k divider:
-// ~33 mV sensor × 15/25 = ~20 mV. Use 30 mV threshold for safety margin.
+// Sensor resting offset at the ADC pin with R1=10k/R2=22k divider:
+// ~33 mV sensor × 22/32 = ~23 mV. Use 30 mV threshold for safety margin.
 #define WIND_ADC_ZERO_OFFSET_MV  30
 
 static void wind_task(void *arg) {
@@ -1120,8 +1137,8 @@ static void wind_task(void *arg) {
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
 
-    // ADC_ATTEN_DB_11: accurate range 150–2450 mV. Use R1=10k/R2=15k divider
-    // so 4 V sensor max maps to 2400 mV, safely within the accurate range.
+    // ADC_ATTEN_DB_11: accurate range 150–2450 mV. Use R1=10k/R2=22k divider
+    // so 3.3 V sensor max maps to 2270 mV, safely within the accurate range.
     adc_oneshot_chan_cfg_t chan_cfg = {
         .atten    = ADC_ATTEN_DB_11,
         .bitwidth = ADC_BITWIDTH_12,
@@ -1201,6 +1218,75 @@ static void wind_task(void *arg) {
 }
 #endif
 
+// ── Rain sensor ───────────────────────────────────────────────────────────────
+#ifdef CONFIG_RAIN_SENSOR_ENABLE
+/*
+ * MH-RD rain sensor — implementation notes:
+ *
+ * POWER:   VCC = 3.3 V, GND = GND. The module has an onboard LM393 comparator.
+ *          Sensitivity is set via the onboard potentiometer.
+ *
+ * OUTPUT:  DO = digital output. Active-low by default (DO goes LOW when rain
+ *          is detected). Configure RAIN_SENSOR_ACTIVE_LEVEL = 0 (default).
+ *          AO (analog output) is not used.
+ *
+ * NOISE:   The sensing pad corrodes outdoors over time. Mount the pad under a
+ *          sheltered overhang to limit exposure. The 2 s debounce prevents
+ *          false triggers from brief condensation or dust.
+ */
+static void rain_task(void *arg) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << RAIN_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = (RAIN_ACTIVE_LEVEL == 0) ? GPIO_PULLUP_ENABLE  : GPIO_PULLUP_DISABLE,
+        .pull_down_en = (RAIN_ACTIVE_LEVEL == 1) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    ESP_LOGI(TAG_RAIN,
+             "MH-RD ready: GPIO%d active_%s poll=%lums debounce=%lums",
+             RAIN_GPIO,
+             RAIN_ACTIVE_LEVEL ? "high" : "low",
+             (unsigned long)RAIN_POLL_MS,
+             (unsigned long)RAIN_DEBOUNCE_MS);
+
+    bool     last_raw   = (gpio_get_level(RAIN_GPIO) == RAIN_ACTIVE_LEVEL);
+    uint32_t changed_at = now_ms();
+    bool     stable     = last_raw;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(RAIN_POLL_MS));
+
+        bool     raw  = (gpio_get_level(RAIN_GPIO) == RAIN_ACTIVE_LEVEL);
+        uint32_t now  = now_ms();
+
+        if (raw != last_raw) {
+            last_raw   = raw;
+            changed_at = now;
+        }
+
+        if ((now - changed_at) >= RAIN_DEBOUNCE_MS) {
+            bool new_stable = raw;
+
+            if (new_stable && !stable) {
+                ESP_LOGW(TAG_RAIN, "Rain detected: closing for protection (saved pos=%d%%)",
+                         s_tgt_pos);
+                s_rain_saved_pos = s_tgt_pos;
+                s_rain_closed    = true;
+                sunshade_close();
+            } else if (!new_stable && stable) {
+                ESP_LOGI(TAG_RAIN, "Rain stopped: restoring to %d%%", s_rain_saved_pos);
+                s_rain_closed = false;
+                sunshade_move_to(s_rain_saved_pos);
+            }
+
+            stable = new_stable;
+        }
+    }
+}
+#endif
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 void app_main(void) {
     ESP_ERROR_CHECK(lifecycle_nvs_init());
@@ -1256,6 +1342,12 @@ void app_main(void) {
 #ifdef CONFIG_WIND_SENSOR_ENABLE
     if (xTaskCreate(wind_task, "wind_task", 3072, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create wind task");
+    }
+#endif
+
+#ifdef CONFIG_RAIN_SENSOR_ENABLE
+    if (xTaskCreate(rain_task, "rain_task", 2048, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create rain task");
     }
 #endif
 
