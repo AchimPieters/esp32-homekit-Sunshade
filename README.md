@@ -23,11 +23,12 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 12. [OTA updates](#12-ota-updates)
 13. [Wind speed sensor (optional)](#13-wind-speed-sensor-optional)
 14. [Rain sensor (optional)](#14-rain-sensor-optional)
-15. [Menuconfig reference](#15-menuconfig-reference)
-16. [NVS storage layout](#16-nvs-storage-layout)
-17. [How position tracking works](#17-how-position-tracking-works)
-18. [Troubleshooting](#18-troubleshooting)
-19. [Requirements](#19-requirements)
+15. [Sunrise / sunset automations](#15-sunrise--sunset-automations)
+16. [Menuconfig reference](#16-menuconfig-reference)
+17. [NVS storage layout](#17-nvs-storage-layout)
+18. [How position tracking works](#18-how-position-tracking-works)
+19. [Troubleshooting](#19-troubleshooting)
+20. [Requirements](#20-requirements)
 
 ---
 
@@ -452,7 +453,55 @@ Mount the sensing pad under a sheltered overhang so only falling rain reaches it
 
 ---
 
-## 15. Menuconfig reference  
+## 15. Sunrise / sunset automations
+
+No firmware changes are needed. The Home app has built-in sunrise/sunset automation that uses your Home Hub's GPS location and local timezone — more accurate than any on-device calculation.
+
+### Requirements
+
+- A **Home Hub** running continuously: HomePod mini, HomePod, or Apple TV 4K
+- **Location services** enabled for the Home app on the Home Hub device
+
+Without a Home Hub, time-based automations do not run.
+
+### Setting up a sunrise automation (open at sunrise)
+
+1. Open the **Home** app → tap the **Automations** tab.
+2. Tap **+** → **A time of day occurs**.
+3. Select **Sunrise**. Optionally add an offset: tap **Sunrise** again and choose e.g. **30 minutes after sunrise**.
+4. Tap **Next** → select the **Sun Screen** tile.
+5. Tap **Next** → drag the position slider to the desired open position (e.g. 80 %).
+6. Tap **Done**.
+
+### Setting up a sunset automation (close at sunset)
+
+Follow the same steps but select **Sunset** and set the position to **0 %**.
+
+### Recommended automation set
+
+| When | Position | Purpose |
+|------|----------|---------|
+| Sunrise | 80 % | Open partially in the morning |
+| Sunrise + 2 h | 100 % | Fully open once sun is higher |
+| Sunset − 30 min | 0 % | Close before it gets dark |
+
+### Adding conditions
+
+Tap **Add Condition** on the automation screen to restrict when an automation runs:
+
+| Condition | Example use |
+|-----------|-------------|
+| **People** | Only open when someone is home |
+| **Time range** | Only run between April and September |
+| **Accessory state** | Only open if a door/window sensor is closed |
+
+### Combining with wind and rain protection
+
+The wind and rain tasks run in firmware and override HomeKit commands when triggered. If the Home app opens the sunshade at sunrise but wind exceeds the threshold shortly after, the firmware closes it automatically. When wind drops, it restores the position the Home app set — not the sunrise position. This is correct behaviour: the last HomeKit-commanded position is always the restore target.
+
+---
+
+## 16. Menuconfig reference  
 
 Open with `idf.py menuconfig` → **StudioPieters**.
 
@@ -488,7 +537,7 @@ Open with `idf.py menuconfig` → **StudioPieters**.
 
 ---
 
-## 16. NVS storage layout
+## 17. NVS storage layout
 
 | Namespace | Key | Type | Description |
 |-----------|-----|------|-------------|
@@ -500,7 +549,7 @@ The Lifecycle Manager uses a separate namespace for WiFi credentials and reboot 
 
 ---
 
-## 17. How position tracking works
+## 18. How position tracking works
 
 The device uses **time-based position estimation** because there are no limit switches or encoders.
 
@@ -522,7 +571,7 @@ If a new command arrives while the motor is running (e.g. stop at 60 % then move
 
 ---
 
-## 18. Troubleshooting
+## 19. Troubleshooting
 
 ### Sunshade does not respond to touch
 
@@ -593,7 +642,7 @@ idf.py set-target esp32
 
 ---
 
-## 19. Requirements
+## 20. Requirements
 
 | Component | Version |
 |-----------|---------|
