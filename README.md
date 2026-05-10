@@ -19,11 +19,12 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 10. [Physical button](#10-physical-button)
 11. [Identify LED](#11-identify-led)
 12. [OTA updates](#12-ota-updates)
-13. [Menuconfig reference](#13-menuconfig-reference)
-14. [NVS storage layout](#14-nvs-storage-layout)
-15. [How position tracking works](#15-how-position-tracking-works)
-16. [Troubleshooting](#16-troubleshooting)
-17. [Requirements](#17-requirements)
+13. [Wind speed sensor (optional)](#13-wind-speed-sensor-optional)
+14. [Menuconfig reference](#14-menuconfig-reference)
+15. [NVS storage layout](#15-nvs-storage-layout)
+16. [How position tracking works](#16-how-position-tracking-works)
+17. [Troubleshooting](#17-troubleshooting)
+18. [Requirements](#18-requirements)
 
 ---
 
@@ -75,12 +76,12 @@ GND (common) ──────────► motor common
 
 ### Touch pad construction
 
-Each capacitive button consists of:
-- A **copper ring or pad** as the sensing electrode
-- A **shielded cable** (braid connected to GND) to prevent false positives from cable routing
-- A **ground plane** around the pad where possible
+Each capacitive button uses a **TTP223 module** between the electrode and the ESP32:
 
-The pads connect directly to the ESP32 touch channel pins. No additional components are needed.
+- A **copper ring or pad** as the sensing electrode, wired to the TTP223 SIG input
+- A **TTP223 capacitive touch module** (momentary mode, active-high) providing a clean digital output
+- A **shielded cable** (braid connected to GND) between the pad and the module to prevent false positives
+- ESP32 reads the TTP223 digital output via a regular GPIO input — the internal touch peripheral is not used
 
 ---
 
@@ -305,7 +306,99 @@ The Lifecycle Manager handles the update process and version tracking automatica
 
 ---
 
-## 13. Menuconfig reference
+## 13. Wind speed sensor (optional) — HWFS-1
+
+The **HWFS-1** is a passive cup anemometer with a 0–4 V analog output. It can automatically close the sunshade when wind exceeds a configurable threshold.
+
+Enable via `idf.py menuconfig` → **StudioPieters** → **Wind Speed Sensor**.
+
+### Sensor characteristics
+
+| Property | Value |
+|----------|-------|
+| Model | HWFS-1 |
+| Power | **Passive — no external VCC needed** (self-powered by rotation) |
+| Output | 0–4 V analog, DC generator |
+| Manufacturer formula | `V_out × 14 = m/s` (4 V = 56 m/s) |
+| **Empirical formula** | **`V_out × 2.58 = m/s`** (4 V ≈ 10.3 m/s at low wind speeds) |
+| Resting offset | ~33 mV at 0 m/s (not true 0 V) |
+| Accuracy | ±10 % (manufacturer); nonlinear below ~2 m/s |
+| Cable | 2 conductors: signal (black + stripe) + GND (solid black) |
+
+> **Important — manufacturer formula is wrong at sunshade-relevant speeds.**  
+> The HWFS-1 uses a small DC permanent-magnet generator. At low RPM, cogging torque and brush friction introduce significant nonlinearity. Field tests against calibrated reference meters show the manufacturer's V × 14 factor overestimates by **5–6×** at 2–8 m/s. The empirically derived factor is V × 2.58, giving 10.3 m/s at 4 V. The firmware default (`WIND_SENSOR_MAX_SPEED_DS = 103`) uses this corrected value. Always verify against a reference instrument and adjust if needed.
+
+### Wiring
+
+The sensor output reaches 4 V which exceeds the ESP32's 3.3 V ADC maximum. A voltage divider is required. Use **R1 = 10 kΩ + R2 = 15 kΩ** to stay within the ESP32 ADC accurate range (150–2450 mV with `ADC_ATTEN_DB_11`).
+
+```
+HWFS-1 signal wire (black+stripe)
+         │
+         ├── R1 (10 kΩ) ──┬── R2 (15 kΩ) ──► GND
+         │                │
+         │          (optional RC filter:
+         │           10 kΩ + 10 µF to GND,
+         │           τ ≈ 100 ms, reduces ripple)
+         │                │
+         └────────────────┴──► ESP32 GPIO34 (ADC)
+
+HWFS-1 ground wire (solid black) ──► GND
+```
+
+At 4 V sensor output: V_ADC = 4.0 × 15 / (10 + 15) = **2.40 V** ✓ (within 2450 mV limit)  
+At 8 m/s empirical: V_sensor ≈ 8 / 2.58 = 3.1 V → V_ADC = **1.86 V** ✓
+
+> No VCC connection is needed. The HWFS-1 generates its own signal voltage from wind rotation.
+
+> Only ADC1 GPIOs (GPIO32–39) are supported. ADC2 conflicts with WiFi.
+
+> Avoid R2 = 22 kΩ (gives 2.75 V at 4 V input — above the 2450 mV accurate ADC range).
+
+### Conversion formula
+
+The firmware uses a linear mapping:
+
+```
+speed (m/s) = (V_ADC / V_ADC_fullscale) × MAX_SPEED_DS / 10
+```
+
+With the defaults (R1=10k/R2=15k, `WIND_SENSOR_ADC_FULL_SCALE_MV = 2400`, `WIND_SENSOR_MAX_SPEED_DS = 103`):
+
+```
+speed (m/s) ≈ V_out × 2.58    (empirical, for 2–10 m/s range)
+```
+
+The resting offset (~20 mV at the ADC pin after divider) is masked — readings at or below 30 mV are reported as 0 m/s.
+
+### ADC noise and DC generator ripple
+
+The HWFS-1's commutator generates voltage ripple. Two mitigation layers are implemented:
+
+- **Software:** 16 ADC samples are averaged per reading (5 ms between samples).
+- **Hardware (recommended):** Place a 10 kΩ + 10 µF RC low-pass filter (τ ≈ 100 ms) on the signal wire before the ADC pin.
+
+### Behaviour
+
+| Condition | Action |
+|-----------|--------|
+| Wind ≥ close threshold (default **8.0 m/s**) | Sunshade closes; previous target position is saved |
+| Wind < reopen threshold (default **5.0 m/s**) | Sunshade restores to the saved position |
+
+The hysteresis gap (3 m/s by default) prevents rapid cycling when wind hovers near the threshold.
+
+### Field calibration procedure
+
+1. Flash with `WIND_SENSOR_ENABLE = y` and default settings.
+2. At startup the log prints the effective calibration factor: `HWFS-1 ready: ... cal factor V×2.5 m/s`.
+3. Run `idf.py monitor` and observe the `WIND:` log lines: `1.2 m/s (avg_raw=XXX, 120 mV)`.
+4. Hold a calibrated reference anemometer next to the HWFS-1 in steady wind.
+5. Compare the readings. If they differ significantly, calculate the correct factor and adjust `WIND_SENSOR_MAX_SPEED_DS` until the readings match.
+6. Example: if the reference shows 6.0 m/s but firmware shows 3.5 m/s, increase `MAX_SPEED_DS` by the ratio (6.0/3.5 × 103 ≈ 177).
+
+---
+
+## 14. Menuconfig reference  
 
 Open with `idf.py menuconfig` → **StudioPieters**.
 
@@ -327,9 +420,21 @@ Open with `idf.py menuconfig` → **StudioPieters**.
 
 > Changing `ESP_SETUP_CODE` or `ESP_SETUP_ID` requires a new QR code.
 
+**Wind Speed Sensor** (`WIND_SENSOR_ENABLE = y`):
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `WIND_SENSOR_ENABLE` | n | Enable HWFS-1 wind speed sensor |
+| `WIND_SENSOR_ADC_GPIO` | 34 | ADC1 GPIO for signal wire (after voltage divider) |
+| `WIND_SENSOR_ADC_FULL_SCALE_MV` | **2400** | ADC voltage (mV) at sensor full-scale (4 V → 2400 mV with R1=10k/R2=15k) |
+| `WIND_SENSOR_MAX_SPEED_DS` | **103** | Full-scale wind speed in dm/s (103 = 10.3 m/s, empirical V×2.58; manufacturer V×14 = 560 — do not use) |
+| `WIND_SENSOR_CLOSE_THRESHOLD_DS` | 80 | Close threshold in dm/s (80 = 8.0 m/s, Beaufort 5) |
+| `WIND_SENSOR_REOPEN_THRESHOLD_DS` | 50 | Reopen hysteresis in dm/s (50 = 5.0 m/s) |
+| `WIND_SENSOR_POLL_MS` | 2000 | ADC sample interval in ms |
+
 ---
 
-## 14. NVS storage layout
+## 15. NVS storage layout
 
 | Namespace | Key | Type | Description |
 |-----------|-----|------|-------------|
@@ -341,7 +446,7 @@ The Lifecycle Manager uses a separate namespace for WiFi credentials and reboot 
 
 ---
 
-## 15. How position tracking works
+## 16. How position tracking works
 
 The device uses **time-based position estimation** because there are no limit switches or encoders.
 
@@ -363,7 +468,7 @@ If a new command arrives while the motor is running (e.g. stop at 60 % then move
 
 ---
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 ### Sunshade does not respond to touch
 
@@ -397,6 +502,20 @@ Recalibrate. Measure the actual travel time with a stopwatch; if it differs sign
 - Double press the physical button to reset HomeKit pairing, then re-provision WiFi.
 - Long press the physical button for a full factory reset.
 
+### Wind sensor reads 0 or incorrect speed
+
+1. Confirm `WIND_SENSOR_ENABLE = y` in menuconfig.
+2. Check `WIND: Wind sensor ready:` in the boot log. If absent, the task failed to start.
+3. Verify the voltage divider: measure V_ADC with a multimeter while blowing on the sensor. It should increase from ~0 V (no wind) toward the configured `WIND_SENSOR_ADC_FULL_SCALE_MV`.
+4. Confirm the GPIO is on ADC1 (GPIO32–39). The log prints an error if ADC2 is used.
+5. Increase `WIND_SENSOR_POLL_MS` if you see ADC read errors in the log.
+
+### Sunshade does not close on high wind
+
+- Check the serial log for `WIND: Wind X.X m/s` messages to confirm readings.
+- Lower `WIND_SENSOR_CLOSE_THRESHOLD_DS` in menuconfig.
+- The HWFS-1 is self-powered — no supply voltage is needed. Verify only signal and GND are connected.
+
 ### `idf.py set-target` CMake error
 
 ```bash
@@ -406,7 +525,7 @@ idf.py set-target esp32
 
 ---
 
-## 17. Requirements
+## 18. Requirements
 
 | Component | Version |
 |-----------|---------|

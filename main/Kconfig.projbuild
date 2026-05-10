@@ -93,4 +93,88 @@ menu "StudioPieters"
         help
             HomeKit setup ID. Changing this value requires a new QR code.
 
+    menu "Wind Speed Sensor (optional)"
+
+        config WIND_SENSOR_ENABLE
+            bool "Enable wind speed sensor (HWFS-1 / 0-4 V anemometer)"
+            default n
+            help
+                Enable the HWFS-1 passive anemometer (0–4 V analog output).
+                The sensor is self-powered by wind rotation — no external VCC needed.
+                Wiring: signal wire (black+stripe) → voltage divider → ADC GPIO.
+                        ground wire (solid black) → GND.
+                The 4 V output must be divided to ≤3.3 V before the ADC pin.
+                Recommended divider: R1=10 kΩ + R2=22 kΩ → 4 V becomes 2.75 V.
+                Only ADC1 GPIOs (GPIO32–39) are supported; ADC2 conflicts with WiFi.
+
+        config WIND_SENSOR_ADC_GPIO
+            int "Wind sensor ADC GPIO"
+            default 34
+            range 32 39
+            depends on WIND_SENSOR_ENABLE
+            help
+                ADC1 GPIO connected to the voltage-divided sensor signal wire.
+                GPIO34 and GPIO35 are input-only and are the recommended choice.
+
+        config WIND_SENSOR_ADC_FULL_SCALE_MV
+            int "ADC voltage at sensor full-scale output (mV)"
+            default 2400
+            range 100 3300
+            depends on WIND_SENSOR_ENABLE
+            help
+                ADC input voltage (mV) when the sensor outputs its maximum 4 V.
+                ESP32 ADC_ATTEN_DB_11 accurate range: 150–2450 mV.
+                Recommended divider to stay within that range:
+                  R1=10 kΩ + R2=15 kΩ → 4000 × 15/25 = 2400 mV (default, safe).
+                  R1=10 kΩ + R2=22 kΩ → 4000 × 22/32 = 2750 mV (too high, avoid).
+                Change only if you use a different resistor ratio.
+
+        config WIND_SENSOR_MAX_SPEED_DS
+            int "Wind speed at ADC full scale (dm/s, 1 dm/s = 0.1 m/s)"
+            default 103
+            range 10 1000
+            depends on WIND_SENSOR_ENABLE
+            help
+                WARNING: The manufacturer publishes V×14=m/s (560 dm/s at 4 V).
+                Field tests against a calibrated reference meter show this formula
+                overestimates by 5–6× at low wind speeds. The empirically derived
+                factor is V×2.58=m/s: at 4 V → 10.3 m/s = 103 dm/s (default).
+                The HWFS-1 uses a DC generator whose V-vs-speed curve is nonlinear,
+                especially below 5 m/s (cogging torque). Calibrate against a
+                reference instrument and adjust this value accordingly.
+                Manufacturer value (unverified at high speeds): 560.
+
+        config WIND_SENSOR_CLOSE_THRESHOLD_DS
+            int "Auto-close threshold (dm/s)"
+            default 80
+            range 10 1000
+            depends on WIND_SENSOR_ENABLE
+            help
+                Wind speed above which the sunshade closes automatically for protection.
+                80 = 8.0 m/s (Beaufort 5 — recommended maximum for most sunshades).
+                Typical sunshade manufacturer limits: 6–10 m/s.
+                After field calibration, verify this threshold with a reference meter.
+
+        config WIND_SENSOR_REOPEN_THRESHOLD_DS
+            int "Re-open hysteresis threshold (dm/s)"
+            default 50
+            range 10 1000
+            depends on WIND_SENSOR_ENABLE
+            help
+                Wind speed below which the sunshade restores its previous position
+                after a wind-protection close. Must be lower than the close threshold
+                to prevent rapid cycling.
+
+        config WIND_SENSOR_POLL_MS
+            int "Wind sensor poll interval (ms)"
+            default 2000
+            range 500 30000
+            depends on WIND_SENSOR_ENABLE
+            help
+                Interval between wind speed readings. Each reading averages 16 ADC
+                samples internally to reduce commutator ripple and brush noise.
+                2000 ms is a good default; cup anemometers respond within 1–3 s.
+
+    endmenu
+
 endmenu

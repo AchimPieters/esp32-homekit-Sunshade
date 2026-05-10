@@ -55,6 +55,10 @@
 
 #include <driver/gpio.h>
 
+#ifdef CONFIG_WIND_SENSOR_ENABLE
+#include <esp_adc/adc_oneshot.h>
+#endif
+
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
 
@@ -90,6 +94,16 @@
 #define NVS_CAL_MS      "cal_ms"
 #define NVS_LAST_POS    "last_pos"
 
+// ── Wind sensor (optional) ────────────────────────────────────────────────────
+#ifdef CONFIG_WIND_SENSOR_ENABLE
+#define WIND_ADC_GPIO            CONFIG_WIND_SENSOR_ADC_GPIO
+#define WIND_ADC_FULL_SCALE_MV   CONFIG_WIND_SENSOR_ADC_FULL_SCALE_MV
+#define WIND_MAX_SPEED_DS        CONFIG_WIND_SENSOR_MAX_SPEED_DS
+#define WIND_CLOSE_THRESHOLD_DS  CONFIG_WIND_SENSOR_CLOSE_THRESHOLD_DS
+#define WIND_REOPEN_THRESHOLD_DS CONFIG_WIND_SENSOR_REOPEN_THRESHOLD_DS
+#define WIND_POLL_MS             CONFIG_WIND_SENSOR_POLL_MS
+#endif
+
 // ── Log tags ──────────────────────────────────────────────────────────────────
 static const char *TAG        = "SUNSHADE";
 static const char *TAG_TOUCH  = "TTP223";
@@ -97,6 +111,9 @@ static const char *TAG_BUTTON = "BUTTON";
 static const char *TAG_RELAY  = "RELAY";
 static const char *TAG_CAL    = "CAL";
 static const char *TAG_NVS    = "NVS";
+#ifdef CONFIG_WIND_SENSOR_ENABLE
+static const char *TAG_WIND   = "WIND";
+#endif
 
 // ── Motion state ──────────────────────────────────────────────────────────────
 typedef enum {
@@ -125,6 +142,12 @@ static volatile uint32_t    s_cal_ms      = DEFAULT_TRAVEL_MS;
 static volatile uint32_t    s_cal_t0_ms   = 0;
 static volatile bool        s_is_homing   = false;
 static volatile bool        s_cal_success = false;
+
+// ── Wind protection state ─────────────────────────────────────────────────────
+#ifdef CONFIG_WIND_SENSOR_ENABLE
+static volatile bool s_wind_closed    = false;
+static volatile int  s_wind_saved_pos = 0;
+#endif
 
 // ── Forward declarations ───────────────────────────────────────────────────────
 static void sunshade_stop(void);
@@ -1028,6 +1051,156 @@ static void on_wifi_ready(void) {
     homekit_started = true;
 }
 
+// ── Wind speed sensor ─────────────────────────────────────────────────────────
+#ifdef CONFIG_WIND_SENSOR_ENABLE
+/*
+ * HWFS-1 anemometer — implementation notes (based on field research):
+ *
+ * POWER:     Passive / self-generating. NO external VCC required.
+ *            The rotating cups drive a small DC generator in the base.
+ *            Wiring: signal wire (black+stripe) and ground wire (solid black) only.
+ *
+ * OUTPUT:    0–4 V DC analog. Max safe ESP32 ADC input is 3.6 V → voltage divider
+ *            is mandatory. Use R1=10 kΩ + R2=15 kΩ for 2.4 V max at ADC pin,
+ *            keeping within ESP32 ADC_ATTEN_DB_11 accurate range (150–2450 mV).
+ *
+ * FORMULA:   Manufacturer publishes V × 14 = m/s (4 V = 56 m/s).
+ *            Field test against calibrated reference meter (DFRobot community,
+ *            2024) showed V × 14 overestimates by 5–6× at low wind speeds.
+ *            Empirically derived factor at 2–3 m/s: V × 2.58 = m/s.
+ *            The discrepancy is caused by DC generator nonlinearity (cogging
+ *            torque, brush friction) which is worst at low RPM.
+ *            Default Kconfig WIND_SENSOR_MAX_SPEED_DS = 103 reflects V × 2.58.
+ *            Calibrate against a reference instrument and adjust.
+ *
+ * NOISE:     DC commutator generates ripple voltage. Cogging creates step-wise
+ *            output near startup threshold. Hardware: place 10 kΩ + 10 µF RC
+ *            low-pass filter (τ ≈ 100 ms) on the signal before the ESP32 ADC.
+ *            Software: 16-sample average per reading (implemented below).
+ *
+ * ADC:       ESP32 internal ADC has ±10% nonlinearity without calibration.
+ *            ADC_ATTEN_DB_11 useful range: 150 mV–2450 mV. Above this the
+ *            reading saturates nonlinearly. Stay within range with the divider.
+ *            ESP32 ADC reads unreliably below ~100 mV; the 30 mV resting offset
+ *            is masked by the WIND_ADC_ZERO_OFFSET_MV threshold below.
+ */
+
+// Number of ADC samples averaged per reading to reduce commutator ripple.
+#define WIND_ADC_SAMPLES  16
+
+// ADC_ATTEN_DB_11 full-scale approximation (mV). Actual varies ±5% per chip.
+#define WIND_ADC_ATTEN_FS_MV  2450
+
+// Sensor resting offset at the ADC pin with R1=10k/R2=15k divider:
+// ~33 mV sensor × 15/25 = ~20 mV. Use 30 mV threshold for safety margin.
+#define WIND_ADC_ZERO_OFFSET_MV  30
+
+static void wind_task(void *arg) {
+    adc_unit_t    adc_unit;
+    adc_channel_t adc_channel;
+
+    if (adc_oneshot_io_to_channel(WIND_ADC_GPIO, &adc_unit, &adc_channel) != ESP_OK) {
+        ESP_LOGE(TAG_WIND, "GPIO%d is not a valid ADC pin; wind task disabled", WIND_ADC_GPIO);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // ADC2 conflicts with WiFi on ESP32; only ADC1 (GPIO32-39) is safe.
+    if (adc_unit != ADC_UNIT_1) {
+        ESP_LOGE(TAG_WIND, "GPIO%d maps to ADC2 (conflicts with WiFi); use GPIO32-39",
+                 WIND_ADC_GPIO);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    adc_oneshot_unit_handle_t adc_handle;
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
+
+    // ADC_ATTEN_DB_11: accurate range 150–2450 mV. Use R1=10k/R2=15k divider
+    // so 4 V sensor max maps to 2400 mV, safely within the accurate range.
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_11,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, adc_channel, &chan_cfg));
+
+    ESP_LOGI(TAG_WIND,
+             "HWFS-1 ready: GPIO%d | cal factor V×%d.%d m/s | "
+             "close >= %d.%d m/s | reopen < %d.%d m/s | poll %lu ms | %d samples/reading",
+             WIND_ADC_GPIO,
+             (WIND_MAX_SPEED_DS * 1000 / WIND_ADC_FULL_SCALE_MV) / 10,
+             (WIND_MAX_SPEED_DS * 1000 / WIND_ADC_FULL_SCALE_MV) % 10,
+             WIND_CLOSE_THRESHOLD_DS / 10,  WIND_CLOSE_THRESHOLD_DS % 10,
+             WIND_REOPEN_THRESHOLD_DS / 10, WIND_REOPEN_THRESHOLD_DS % 10,
+             (unsigned long)WIND_POLL_MS,
+             WIND_ADC_SAMPLES);
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(WIND_POLL_MS));
+
+        // Average WIND_ADC_SAMPLES readings to suppress commutator ripple and
+        // brush-contact noise. Spread samples evenly within the poll interval.
+        int32_t raw_sum = 0;
+        int     valid   = 0;
+        for (int s = 0; s < WIND_ADC_SAMPLES; s++) {
+            int raw = 0;
+            if (adc_oneshot_read(adc_handle, adc_channel, &raw) == ESP_OK) {
+                raw_sum += raw;
+                valid++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        if (valid == 0) {
+            ESP_LOGW(TAG_WIND, "All ADC reads failed");
+            continue;
+        }
+
+        int raw_avg = (int)(raw_sum / valid);
+
+        // Convert averaged raw counts to mV using the ADC_ATTEN_DB_11 full-scale.
+        int mv = (int)((float)raw_avg * (float)WIND_ADC_ATTEN_FS_MV / 4095.0f);
+
+        // Mask the resting offset (~33 mV sensor → ~20 mV at ADC after divider).
+        // Also masks the ESP32 ADC's unreliable sub-100 mV region.
+        if (mv <= WIND_ADC_ZERO_OFFSET_MV) {
+            mv = 0;
+        }
+
+        // Linear conversion: speed_ds = mv × MAX_SPEED_DS / ADC_FULL_SCALE_MV
+        // This implements: speed(m/s) = V_sensor × calibration_factor
+        // where calibration_factor is derived from MAX_SPEED_DS and the divider ratio.
+        int speed_ds = (int)((float)mv / (float)WIND_ADC_FULL_SCALE_MV
+                             * (float)WIND_MAX_SPEED_DS);
+        if (speed_ds < 0) speed_ds = 0;
+
+        // Log at INFO level so installers can read raw mV for field calibration.
+        ESP_LOGI(TAG_WIND, "%d.%d m/s (avg_raw=%d, %d mV)",
+                 speed_ds / 10, speed_ds % 10, raw_avg, mv);
+
+        if (!s_wind_closed && speed_ds >= WIND_CLOSE_THRESHOLD_DS) {
+            ESP_LOGW(TAG_WIND, "Wind %d.%d m/s >= %d.%d m/s: closing for protection",
+                     speed_ds / 10, speed_ds % 10,
+                     WIND_CLOSE_THRESHOLD_DS / 10, WIND_CLOSE_THRESHOLD_DS % 10);
+            s_wind_saved_pos = s_tgt_pos;
+            s_wind_closed    = true;
+            sunshade_close();
+        } else if (s_wind_closed && speed_ds < WIND_REOPEN_THRESHOLD_DS) {
+            ESP_LOGI(TAG_WIND, "Wind %d.%d m/s < %d.%d m/s: restoring to %d%%",
+                     speed_ds / 10, speed_ds % 10,
+                     WIND_REOPEN_THRESHOLD_DS / 10, WIND_REOPEN_THRESHOLD_DS % 10,
+                     s_wind_saved_pos);
+            s_wind_closed = false;
+            sunshade_move_to(s_wind_saved_pos);
+        }
+    }
+}
+#endif
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 void app_main(void) {
     ESP_ERROR_CHECK(lifecycle_nvs_init());
@@ -1079,6 +1252,12 @@ void app_main(void) {
         ESP_LOGW(TAG, "Not calibrated: skipping homing.");
         ESP_LOGW(TAG, "Hold STOP touch pad for 3 s to start calibration.");
     }
+
+#ifdef CONFIG_WIND_SENSOR_ENABLE
+    if (xTaskCreate(wind_task, "wind_task", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create wind task");
+    }
+#endif
 
     esp_err_t wifi_err = wifi_start(on_wifi_ready);
 
