@@ -31,15 +31,15 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 
 | Feature | Details |
 |---------|---------|
-| **HomeKit service** | `WINDOW_COVERING` – current position, target position, position state |
+| **HomeKit service** | `WINDOW_COVERING` – current position, target position, position state, hold position |
 | **Accessory category** | Window Covering (tile icon in the Home app) |
 | **Relay outputs** | GPIO16 (OPEN/UP), GPIO17 (CLOSE/DOWN) with software interlock |
-| **Touch buttons** | Capacitive: UP (GPIO32/T9), STOP (GPIO33/T8), DOWN (GPIO27/T7) |
+| **Touch buttons** | TTP223 capacitive modules: UP (GPIO32), STOP (GPIO33), DOWN (GPIO27) |
 | **Physical button** | Push button on GPIO25: single/double/long press |
 | **Identify LED** | GPIO23 – blinks on HomeKit Identify, not visible as a service |
 | **Calibration** | Measures actual motor travel time; saved to NVS flash |
 | **Power-loss recovery** | On boot: closes fully, then restores last HomeKit position |
-| **Position tracking** | Time-based, 0–100 %, updated every 200 ms |
+| **Position tracking** | Time-based, 0–100 %, notified on change (max every 500 ms, HAP-compliant) |
 | **OTA** | Firmware update via HomeKit custom characteristic or single button press |
 | **Lifecycle Manager** | WiFi, NVS, factory reset, reboot counter via `esp32-lcm` |
 
@@ -92,9 +92,9 @@ The pads connect directly to the ESP32 touch channel pins. No additional compone
 | **GPIO17** | CLOSE / DOWN relay | Output | Active HIGH; motor runs DOWN |
 | **GPIO23** | Identify LED | Output | Blinks on HomeKit Identify |
 | **GPIO25** | Physical push button | Input | GND → button → GPIO25; active-low |
-| **GPIO27** | Touch DOWN (T7) | Touch input | Capacitive; close/lower sunshade |
-| **GPIO32** | Touch UP (T9) | Touch input | Capacitive; open/raise sunshade |
-| **GPIO33** | Touch STOP (T8) | Touch input | Capacitive; stop + calibration trigger |
+| **GPIO27** | TTP223 DOWN signal | Digital input | Active-high; close/lower sunshade |
+| **GPIO32** | TTP223 UP signal | Digital input | Active-high; open/raise sunshade |
+| **GPIO33** | TTP223 STOP signal | Digital input | Active-high; stop + calibration trigger |
 
 All defaults are configurable via `idf.py menuconfig` → **StudioPieters**.
 
@@ -148,32 +148,29 @@ Calibration teaches the device the actual travel time of your motor by measuring
 
 The motor runs **CLOSED** for `calibrated_time × 1.5`. This guarantees the sunshade reaches the physical end stop even if the stored time is slightly off. The motor stops itself at the end stop; the extra time is harmless.
 
-LED blinks **fast** (200 ms on/off) during this phase.
+LED blinks **fast** (100 ms on/off) during this phase.
 
 ### Phase 2 – open and measure
 
 The motor starts running **OPEN** and a timer counts the elapsed time.  
-LED blinks **slowly** (800 ms on/off).
+LED blinks **slowly** (400 ms on/off).
+
+The **Home app shows the sunshade opening in real time** during this phase — the position indicator moves from 0 % upward based on the previously stored travel time. Use this as a visual guide.
 
 **Watch the sunshade. When it is fully open:**  
 → Press the **STOP touch pad once** (quick tap).
 
 The elapsed time is saved to NVS as the calibrated travel time (`shade/cal_ms`).
 
-### Calibration success
+### Calibration result
 
-The LED blinks **5 times quickly**.  
-The sunshade is now at **100 %** (fully open). HomeKit is notified.  
-From this point on, all positions 0–100 % are available.
+| Result | LED pattern | HomeKit |
+|--------|-------------|---------|
+| **Success** | 5 short flashes | Position set to 100 %; all positions 0–100 % available |
+| **Aborted** (STOP < 2 s after phase 2 start) | 3 long flashes | Position reset to 0 % |
+| **Timeout** (no STOP within 2 minutes) | 3 long flashes | Position reset to 0 % |
 
-### Calibration abort conditions
-
-| Situation | Result |
-|-----------|--------|
-| STOP pressed within 2 s of phase 2 start | Aborted; device stays at 0 % |
-| No STOP press within 2 minutes | Timeout; aborted; device stays at 0 % |
-
-If calibration is aborted, repeat the procedure.
+If calibration fails, repeat the procedure.
 
 ### Re-calibration
 
@@ -223,6 +220,7 @@ Once calibrated, the **Sun Screen** tile in the Home app supports:
 | Drag slider to 100 % | Open sunshade fully |
 | Drag slider to 20–99 % | Move to that exact position |
 | Tap tile (toggle) | Fully open or fully close |
+| **"Hey Siri, stop the sunshade"** | Stop at current position (`HOLD_POSITION`) |
 
 ### Position state
 
@@ -246,13 +244,20 @@ The motor runs for a calculated fraction of the calibrated time and stops via so
 
 ## 9. Touch buttons
 
-Three capacitive touch buttons made of copper rings with shielded cables:
+Three **TTP223 capacitive touch modules** provide digital (HIGH/LOW) signals to the ESP32. The ESP32 reads these as regular GPIO inputs — it does not use its internal touch-sensing peripheral.
 
-| Pad | GPIO | Touch channel | Action |
-|-----|------|---------------|--------|
-| UP | GPIO32 | T9 | Open sunshade to 100 % |
-| STOP | GPIO33 | T8 | Stop immediately (or confirm calibration) |
-| DOWN | GPIO27 | T7 | Close sunshade to 0 % |
+| Pad | GPIO | Action |
+|-----|------|--------|
+| UP | GPIO32 | Open sunshade to 100 % |
+| STOP | GPIO33 | Stop immediately (or confirm calibration open) |
+| DOWN | GPIO27 | Close sunshade to 0 % |
+
+### TTP223 module configuration
+
+Configure each TTP223 module as:
+- **Momentary mode** (not toggle)
+- **Active-high output** (default for most modules)
+- **VCC = 3.3 V**, **GND = GND**
 
 ### Hold STOP for calibration
 
@@ -261,15 +266,9 @@ Three capacitive touch buttons made of copper rings with shielded cables:
 | Quick tap (< 3 s) | Stop motor or confirm calibration open |
 | Hold ≥ 3 s | Start calibration procedure |
 
-### Sensitivity
+### Debounce
 
-Touch pads are calibrated at boot. The threshold is set at **70 %** of the baseline reading (configurable via `TOUCH_THRESHOLD_FACTOR` in `main.c`). Readings are filtered with a 10 ms IIR filter to suppress noise. Baseline values are logged at startup:
-
-```
-I (1234) TOUCH: Baselines – UP(T9/GPIO32):1024  STOP(T8/GPIO33):987  DOWN(T7/GPIO27):1103
-```
-
-If any baseline is below ~100, the pad is likely not connected or the shielding is insufficient.
+Inputs are polled every `ESP_TTP_POLL_MS` (default 25 ms) and debounced over `ESP_TTP_DEBOUNCE_MS` (default 60 ms). Both values are configurable via `idf.py menuconfig`.
 
 ---
 
@@ -316,14 +315,15 @@ Open with `idf.py menuconfig` → **StudioPieters**.
 | `ESP_BUTTON_GPIO` | 25 | GPIO for the physical push button |
 | `ESP_RELAY_OPEN_GPIO` | 16 | GPIO for the OPEN/UP relay |
 | `ESP_RELAY_CLOSE_GPIO` | 17 | GPIO for the CLOSE/DOWN relay |
-| `ESP_TOUCH_UP_GPIO` | 32 | Touch UP pad (T9) – informational |
-| `ESP_TOUCH_STOP_GPIO` | 33 | Touch STOP pad (T8) – informational |
-| `ESP_TOUCH_DOWN_GPIO` | 27 | Touch DOWN pad (T7) – informational |
+| `ESP_TTP_UP_GPIO` | 32 | TTP223 UP module signal GPIO |
+| `ESP_TTP_STOP_GPIO` | 33 | TTP223 STOP module signal GPIO |
+| `ESP_TTP_DOWN_GPIO` | 27 | TTP223 DOWN module signal GPIO |
+| `ESP_TTP_ACTIVE_LEVEL` | 1 | Active level for TTP223 output (1 = active-high) |
+| `ESP_TTP_POLL_MS` | 25 | GPIO poll interval in ms (10–200) |
+| `ESP_TTP_DEBOUNCE_MS` | 60 | Debounce window in ms (10–500) |
 | `SUNSHADE_FULL_TRAVEL_TIME_MS` | 20000 | Default travel time in ms (used before calibration) |
 | `ESP_SETUP_CODE` | 582-94-633 | HomeKit pairing code |
 | `ESP_SETUP_ID` | 7MX2 | HomeKit setup ID |
-
-> **Touch GPIO values** in Kconfig are documentation only. The touch channel numbers (`TOUCH_PAD_NUM7/8/9`) are hardcoded in `main.c` because the GPIO→Touch mapping is fixed in ESP32 silicon.
 
 > Changing `ESP_SETUP_CODE` or `ESP_SETUP_ID` requires a new QR code.
 
@@ -346,10 +346,10 @@ The Lifecycle Manager uses a separate namespace for WiFi credentials and reboot 
 The device uses **time-based position estimation** because there are no limit switches or encoders.
 
 ```
-position_delta_per_tick = 100 % × 200 ms / cal_ms
+position_delta_per_tick = 100 % × 500 ms / cal_ms
 ```
 
-Every 200 ms the movement task adds or subtracts this delta from the current position. When the target is reached, the relay is switched off and HomeKit is notified.
+Every 500 ms the movement task adds or subtracts this delta from the current position. HomeKit is only notified when the integer position value actually changes, keeping notification traffic within the HAP-recommended rate. When the target is reached, the relay is switched off and HomeKit is notified unconditionally.
 
 ### Accuracy
 
@@ -367,9 +367,10 @@ If a new command arrives while the motor is running (e.g. stop at 60 % then move
 
 ### Sunshade does not respond to touch
 
-1. Check the log at boot for `TOUCH: Baselines`. If a value is 0 or very low, the pad is not connected.
-2. Verify shielded cable braids are connected to GND.
-3. Increase `TOUCH_THRESHOLD_FACTOR` (default 0.70) closer to 1.0 for a more sensitive threshold. Edit in `main.c`.
+1. Check the log for `TTP223 inputs:` at boot. The GPIO numbers and active level are printed there.
+2. Verify that each TTP223 module is configured for **momentary mode** and **active-high output**.
+3. Confirm VCC is 3.3 V and GND is connected.
+4. Reduce `ESP_TTP_DEBOUNCE_MS` in menuconfig if the module output is stable but not registering (default 60 ms).
 
 ### Calibration aborts immediately
 

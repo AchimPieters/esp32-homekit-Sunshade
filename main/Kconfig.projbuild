@@ -12,7 +12,8 @@ menu "StudioPieters"
         default 25
         help
             GPIO for the physical push button wired GND -> button -> GPIO.
-            Uses active-low logic. Avoid bootstrapping pins (0, 2, 5, 12, 15).
+            Uses active-low logic with internal pull-up enabled in main.c.
+            Avoid bootstrapping pins (0, 2, 5, 12, 15).
             Single press: OTA update/reboot.
             Double press: HomeKit reset + restart.
             Long press: factory reset + reboot.
@@ -22,35 +23,54 @@ menu "StudioPieters"
         default 16
         help
             GPIO driving the relay that opens / raises the sunshade.
-            Never activated simultaneously with the CLOSE relay (software interlock).
+            Never activated simultaneously with the CLOSE relay.
 
     config ESP_RELAY_CLOSE_GPIO
         int "CLOSE (DOWN) relay GPIO"
         default 17
         help
             GPIO driving the relay that closes / lowers the sunshade.
-            Never activated simultaneously with the OPEN relay (software interlock).
+            Never activated simultaneously with the OPEN relay.
 
-    config ESP_TOUCH_UP_GPIO
-        int "Touch UP GPIO (T9)"
+    config ESP_TTP_UP_GPIO
+        int "TTP223 UP signal GPIO"
         default 32
         help
-            Capacitive touch GPIO for the UP button (GPIO32 = touch channel T9).
-            Activates sunshade open.
+            Digital signal from the UP TTP223 touch module.
 
-    config ESP_TOUCH_STOP_GPIO
-        int "Touch STOP GPIO (T8)"
+    config ESP_TTP_STOP_GPIO
+        int "TTP223 STOP signal GPIO"
         default 33
         help
-            Capacitive touch GPIO for the STOP button (GPIO33 = touch channel T8).
-            Immediately stops all movement.
+            Digital signal from the STOP TTP223 touch module.
 
-    config ESP_TOUCH_DOWN_GPIO
-        int "Touch DOWN GPIO (T7)"
+    config ESP_TTP_DOWN_GPIO
+        int "TTP223 DOWN signal GPIO"
         default 27
         help
-            Capacitive touch GPIO for the DOWN button (GPIO27 = touch channel T7).
-            Activates sunshade close.
+            Digital signal from the DOWN TTP223 touch module.
+
+    config ESP_TTP_ACTIVE_LEVEL
+        int "TTP223 active level"
+        default 1
+        range 0 1
+        help
+            Use 1 for active-high TTP223 modules.
+            Use 0 only if your module is configured as active-low.
+
+    config ESP_TTP_POLL_MS
+        int "TTP223 poll interval (ms)"
+        default 25
+        range 10 200
+        help
+            Polling interval for the TTP223 digital inputs.
+
+    config ESP_TTP_DEBOUNCE_MS
+        int "TTP223 debounce time (ms)"
+        default 60
+        range 10 500
+        help
+            Debounce time for stable TTP223 touch detection.
 
     config SUNSHADE_FULL_TRAVEL_TIME_MS
         int "Full travel time (ms)"
@@ -58,9 +78,8 @@ menu "StudioPieters"
         range 1000 120000
         help
             Time in milliseconds for the sunshade motor to travel the full
-            distance from 0 % (fully closed) to 100 % (fully open), or vice
-            versa. Used for time-based position estimation (no limit switches).
-            Measure your motor and set this value accordingly.
+            distance from 0 % to 100 %, or vice versa. Used for time-based
+            position estimation when not calibrated.
 
     config ESP_SETUP_CODE
         string "HomeKit Setup Code"
