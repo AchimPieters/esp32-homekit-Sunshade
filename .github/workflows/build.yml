@@ -7,8 +7,23 @@ on:
     branches: [main]
 
 jobs:
+  logic-tests:
+    name: Host unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile and run sunshade logic tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I main \
+             test/test_sunshade_logic.c -o sunshade_logic_test
+          ./sunshade_logic_test
+
   build:
     name: ESP-IDF ${{ matrix.idf_version }}
+    needs: logic-tests
     runs-on: ubuntu-latest
 
     strategy:

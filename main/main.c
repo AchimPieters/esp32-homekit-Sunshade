@@ -61,10 +61,15 @@
 
 // rain sensor uses only GPIO — no extra include needed
 
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+#include <driver/i2c_master.h>
+#endif
+
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
 
 #include "esp32-lcm.h"
+#include "sunshade_logic.h"
 #include <button.h>
 
 // ── GPIO pin assignments ───────────────────────────────────────────────────────
@@ -72,6 +77,8 @@
 #define BUTTON_GPIO         CONFIG_ESP_BUTTON_GPIO
 #define RELAY_OPEN_GPIO     CONFIG_ESP_RELAY_OPEN_GPIO
 #define RELAY_CLOSE_GPIO    CONFIG_ESP_RELAY_CLOSE_GPIO
+#define RELAY_ACTIVE_LEVEL  CONFIG_ESP_RELAY_ACTIVE_LEVEL
+#define RELAY_REVERSE_DELAY_MS CONFIG_ESP_RELAY_REVERSE_DELAY_MS
 
 #define TTP_UP_GPIO         CONFIG_ESP_TTP_UP_GPIO
 #define TTP_STOP_GPIO       CONFIG_ESP_TTP_STOP_GPIO
@@ -114,6 +121,16 @@
 #define RAIN_DEBOUNCE_MS   CONFIG_RAIN_SENSOR_DEBOUNCE_MS
 #endif
 
+// ── Light sensor (optional) ───────────────────────────────────────────────────
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+#define LUX_SDA_GPIO        CONFIG_LUX_SENSOR_SDA_GPIO
+#define LUX_SCL_GPIO        CONFIG_LUX_SENSOR_SCL_GPIO
+#define LUX_I2C_ADDR        CONFIG_LUX_SENSOR_I2C_ADDR
+#define LUX_CLOSE_LUX       CONFIG_LUX_SENSOR_CLOSE_THRESHOLD_LUX
+#define LUX_REOPEN_LUX      CONFIG_LUX_SENSOR_REOPEN_THRESHOLD_LUX
+#define LUX_POLL_MS         CONFIG_LUX_SENSOR_POLL_MS
+#endif
+
 // ── Log tags ──────────────────────────────────────────────────────────────────
 static const char *TAG        = "SUNSHADE";
 static const char *TAG_TOUCH  = "TTP223";
@@ -126,6 +143,9 @@ static const char *TAG_WIND   = "WIND";
 #endif
 #ifdef CONFIG_RAIN_SENSOR_ENABLE
 static const char *TAG_RAIN   = "RAIN";
+#endif
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+static const char *TAG_LUX    = "LUX";
 #endif
 
 // ── Motion state ──────────────────────────────────────────────────────────────
@@ -167,6 +187,15 @@ static volatile int  s_wind_saved_pos = 0;
 static volatile bool s_rain_closed    = false;
 static volatile int  s_rain_saved_pos = 0;
 #endif
+
+// ── Light protection state ────────────────────────────────────────────────────
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+static volatile bool s_lux_closed    = false;
+static volatile int  s_lux_saved_pos = 0;
+#endif
+
+// Last direction the relays were energised in, for reversal dead-time tracking.
+static volatile motion_dir_t s_relay_dir = MOTION_STOPPED;
 
 // ── Forward declarations ───────────────────────────────────────────────────────
 static void sunshade_stop(void);
@@ -278,21 +307,39 @@ static void led_write(bool on) {
 }
 
 // ── Relay control ─────────────────────────────────────────────────────────────
+// Honour the board's active level (CONFIG_ESP_RELAY_ACTIVE_LEVEL) and enforce a
+// dead time when reversing direction so an AC tubular motor is never switched
+// straight from one direction to the other.
 static void relays_all_off(void) {
-    gpio_set_level(RELAY_OPEN_GPIO,  0);
-    gpio_set_level(RELAY_CLOSE_GPIO, 0);
+    gpio_set_level(RELAY_OPEN_GPIO,  relay_output_level(RELAY_ACTIVE_LEVEL, false));
+    gpio_set_level(RELAY_CLOSE_GPIO, relay_output_level(RELAY_ACTIVE_LEVEL, false));
+    s_relay_dir = MOTION_STOPPED;
     ESP_LOGD(TAG_RELAY, "Both relays OFF");
 }
 
+static void relay_reverse_guard(motion_dir_t new_dir) {
+    if (RELAY_REVERSE_DELAY_MS > 0 &&
+        s_relay_dir != MOTION_STOPPED && s_relay_dir != new_dir) {
+        gpio_set_level(RELAY_OPEN_GPIO,  relay_output_level(RELAY_ACTIVE_LEVEL, false));
+        gpio_set_level(RELAY_CLOSE_GPIO, relay_output_level(RELAY_ACTIVE_LEVEL, false));
+        ESP_LOGD(TAG_RELAY, "Reversal dead time %d ms", RELAY_REVERSE_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(RELAY_REVERSE_DELAY_MS));
+    }
+}
+
 static void relay_activate_open(void) {
-    gpio_set_level(RELAY_CLOSE_GPIO, 0);
-    gpio_set_level(RELAY_OPEN_GPIO,  1);
+    relay_reverse_guard(MOTION_OPENING);
+    gpio_set_level(RELAY_CLOSE_GPIO, relay_output_level(RELAY_ACTIVE_LEVEL, false));
+    gpio_set_level(RELAY_OPEN_GPIO,  relay_output_level(RELAY_ACTIVE_LEVEL, true));
+    s_relay_dir = MOTION_OPENING;
     ESP_LOGD(TAG_RELAY, "OPEN relay ON");
 }
 
 static void relay_activate_close(void) {
-    gpio_set_level(RELAY_OPEN_GPIO,  0);
-    gpio_set_level(RELAY_CLOSE_GPIO, 1);
+    relay_reverse_guard(MOTION_CLOSING);
+    gpio_set_level(RELAY_OPEN_GPIO,  relay_output_level(RELAY_ACTIVE_LEVEL, false));
+    gpio_set_level(RELAY_CLOSE_GPIO, relay_output_level(RELAY_ACTIVE_LEVEL, true));
+    s_relay_dir = MOTION_CLOSING;
     ESP_LOGD(TAG_RELAY, "CLOSE relay ON");
 }
 
@@ -329,7 +376,7 @@ static void homekit_notify_position(void) {
 // ── Movement task ─────────────────────────────────────────────────────────────
 static void movement_task(void *arg) {
     const uint32_t travel_ms = (s_cal_ms > 0) ? s_cal_ms : DEFAULT_TRAVEL_MS;
-    const float    delta     = 100.0f * POS_UPDATE_INTERVAL_MS / (float)travel_ms;
+    const float    delta     = position_delta_per_tick(travel_ms, POS_UPDATE_INTERVAL_MS);
 
     motion_dir_t last_dir         = s_motion;
     float        pos_f            = (float)s_cur_pos;
@@ -381,7 +428,7 @@ static void movement_task(void *arg) {
             pos_f = 100.0f;
         }
 
-        int new_pos = (int)pos_f;
+        int new_pos = clamp_position((int)pos_f);
         s_cur_pos = new_pos;
         if (new_pos != last_notified) {
             last_notified = new_pos;
@@ -1046,14 +1093,16 @@ static void gpio_init_all(void) {
 
     gpio_reset_pin(RELAY_OPEN_GPIO);
     gpio_set_direction(RELAY_OPEN_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(RELAY_OPEN_GPIO, 0);
+    gpio_set_level(RELAY_OPEN_GPIO, relay_output_level(RELAY_ACTIVE_LEVEL, false));
 
     gpio_reset_pin(RELAY_CLOSE_GPIO);
     gpio_set_direction(RELAY_CLOSE_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(RELAY_CLOSE_GPIO, 0);
+    gpio_set_level(RELAY_CLOSE_GPIO, relay_output_level(RELAY_ACTIVE_LEVEL, false));
+    s_relay_dir = MOTION_STOPPED;
 
-    ESP_LOGI(TAG, "GPIO: LED=%d RELAY_OPEN=%d RELAY_CLOSE=%d",
-             LED_GPIO, RELAY_OPEN_GPIO, RELAY_CLOSE_GPIO);
+    ESP_LOGI(TAG, "GPIO: LED=%d RELAY_OPEN=%d RELAY_CLOSE=%d active_level=%d reverse_delay=%dms",
+             LED_GPIO, RELAY_OPEN_GPIO, RELAY_CLOSE_GPIO,
+             RELAY_ACTIVE_LEVEL, RELAY_REVERSE_DELAY_MS);
 }
 
 // ── WiFi ready ────────────────────────────────────────────────────────────────
@@ -1191,22 +1240,23 @@ static void wind_task(void *arg) {
         // Linear conversion: speed_ds = mv × MAX_SPEED_DS / ADC_FULL_SCALE_MV
         // This implements: speed(m/s) = V_sensor × calibration_factor
         // where calibration_factor is derived from MAX_SPEED_DS and the divider ratio.
-        int speed_ds = (int)((float)mv / (float)WIND_ADC_FULL_SCALE_MV
-                             * (float)WIND_MAX_SPEED_DS);
-        if (speed_ds < 0) speed_ds = 0;
+        int speed_ds = wind_speed_ds(mv, WIND_ADC_FULL_SCALE_MV, WIND_MAX_SPEED_DS);
 
         // Log at INFO level so installers can read raw mV for field calibration.
         ESP_LOGI(TAG_WIND, "%d.%d m/s (avg_raw=%d, %d mV)",
                  speed_ds / 10, speed_ds % 10, raw_avg, mv);
 
-        if (!s_wind_closed && speed_ds >= WIND_CLOSE_THRESHOLD_DS) {
+        sensor_action_t act = sensor_hysteresis(s_wind_closed, speed_ds,
+                                                WIND_CLOSE_THRESHOLD_DS,
+                                                WIND_REOPEN_THRESHOLD_DS);
+        if (act == SENSOR_TRIGGER_CLOSE) {
             ESP_LOGW(TAG_WIND, "Wind %d.%d m/s >= %d.%d m/s: closing for protection",
                      speed_ds / 10, speed_ds % 10,
                      WIND_CLOSE_THRESHOLD_DS / 10, WIND_CLOSE_THRESHOLD_DS % 10);
             s_wind_saved_pos = s_tgt_pos;
             s_wind_closed    = true;
             sunshade_close();
-        } else if (s_wind_closed && speed_ds < WIND_REOPEN_THRESHOLD_DS) {
+        } else if (act == SENSOR_TRIGGER_REOPEN) {
             ESP_LOGI(TAG_WIND, "Wind %d.%d m/s < %d.%d m/s: restoring to %d%%",
                      speed_ds / 10, speed_ds % 10,
                      WIND_REOPEN_THRESHOLD_DS / 10, WIND_REOPEN_THRESHOLD_DS % 10,
@@ -1287,6 +1337,110 @@ static void rain_task(void *arg) {
 }
 #endif
 
+// ── Ambient light sensor ──────────────────────────────────────────────────────
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+/*
+ * BH1750 (GY-302) ambient light sensor — implementation notes:
+ *
+ * BUS:     I2C. VCC = 3.3 V, GND = GND, SDA/SCL on the configured GPIOs.
+ *          GY-302 breakouts carry onboard pull-ups; internal pull-ups are also
+ *          enabled here as a safety net for bare modules.
+ *
+ * ADDRESS: 0x23 when ADDR is tied LOW (default), 0x5C when ADDR is tied HIGH.
+ *
+ * MODE:    Continuous high-resolution mode (1 lux resolution, ~120 ms/sample).
+ *          Reading returns a big-endian 16-bit count; lux = count / 1.2.
+ *
+ * USE:     Bright sun closes the sunshade for shade; once the light drops below
+ *          the reopen threshold the previous position is restored. The same
+ *          high-value hysteresis as the wind protection is used.
+ */
+#define BH1750_CMD_POWER_ON      0x01
+#define BH1750_CMD_CONT_HRES     0x10
+
+static void lux_task(void *arg) {
+    i2c_master_bus_config_t bus_cfg = {
+        .clk_source                 = I2C_CLK_SRC_DEFAULT,
+        .i2c_port                   = I2C_NUM_0,
+        .scl_io_num                 = LUX_SCL_GPIO,
+        .sda_io_num                 = LUX_SDA_GPIO,
+        .glitch_ignore_cnt          = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    i2c_master_bus_handle_t bus = NULL;
+    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
+        ESP_LOGE(TAG_LUX, "I2C bus init failed (SDA=%d SCL=%d); lux task disabled",
+                 LUX_SDA_GPIO, LUX_SCL_GPIO);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = LUX_I2C_ADDR,
+        .scl_speed_hz    = 100000,
+    };
+
+    i2c_master_dev_handle_t dev = NULL;
+    if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) != ESP_OK) {
+        ESP_LOGE(TAG_LUX, "BH1750 not added at 0x%02X; lux task disabled", LUX_I2C_ADDR);
+        i2c_del_master_bus(bus);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t cmd = BH1750_CMD_POWER_ON;
+    bool ok = (i2c_master_transmit(dev, &cmd, 1, 1000) == ESP_OK);
+    cmd = BH1750_CMD_CONT_HRES;
+    ok = ok && (i2c_master_transmit(dev, &cmd, 1, 1000) == ESP_OK);
+    if (!ok) {
+        ESP_LOGE(TAG_LUX, "BH1750 not responding at 0x%02X; check wiring/address",
+                 LUX_I2C_ADDR);
+        i2c_master_bus_rm_device(dev);
+        i2c_del_master_bus(bus);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG_LUX,
+             "BH1750 ready: addr 0x%02X SDA=%d SCL=%d | close >= %d lux | "
+             "reopen < %d lux | poll %d ms",
+             LUX_I2C_ADDR, LUX_SDA_GPIO, LUX_SCL_GPIO,
+             LUX_CLOSE_LUX, LUX_REOPEN_LUX, LUX_POLL_MS);
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(LUX_POLL_MS));
+
+        uint8_t raw[2] = {0};
+        if (i2c_master_receive(dev, raw, sizeof(raw), 1000) != ESP_OK) {
+            ESP_LOGW(TAG_LUX, "BH1750 read failed");
+            continue;
+        }
+
+        uint16_t count = (uint16_t)((raw[0] << 8) | raw[1]);
+        int lux = bh1750_raw_to_lux(count);
+
+        ESP_LOGI(TAG_LUX, "%d lux (raw=%u)", lux, count);
+
+        sensor_action_t act = sensor_hysteresis(s_lux_closed, lux,
+                                                LUX_CLOSE_LUX, LUX_REOPEN_LUX);
+        if (act == SENSOR_TRIGGER_CLOSE) {
+            ESP_LOGW(TAG_LUX, "Light %d lux >= %d lux: closing for sun protection",
+                     lux, LUX_CLOSE_LUX);
+            s_lux_saved_pos = s_tgt_pos;
+            s_lux_closed    = true;
+            sunshade_close();
+        } else if (act == SENSOR_TRIGGER_REOPEN) {
+            ESP_LOGI(TAG_LUX, "Light %d lux < %d lux: restoring to %d%%",
+                     lux, LUX_REOPEN_LUX, s_lux_saved_pos);
+            s_lux_closed = false;
+            sunshade_move_to(s_lux_saved_pos);
+        }
+    }
+}
+#endif
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 void app_main(void) {
     ESP_ERROR_CHECK(lifecycle_nvs_init());
@@ -1348,6 +1502,12 @@ void app_main(void) {
 #ifdef CONFIG_RAIN_SENSOR_ENABLE
     if (xTaskCreate(rain_task, "rain_task", 2048, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create rain task");
+    }
+#endif
+
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+    if (xTaskCreate(lux_task, "lux_task", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create lux task");
     }
 #endif
 

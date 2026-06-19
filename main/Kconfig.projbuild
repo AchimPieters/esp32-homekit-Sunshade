@@ -32,6 +32,27 @@ menu "StudioPieters"
             GPIO driving the relay that closes / lowers the sunshade.
             Never activated simultaneously with the OPEN relay.
 
+    config ESP_RELAY_ACTIVE_LEVEL
+        int "Relay active level"
+        default 1
+        range 0 1
+        help
+            GPIO level that ENERGISES a relay.
+            1 = active-high boards (relay on when the input pin is HIGH).
+            0 = active-low boards — the common opto-isolated 2-channel modules
+                where the relay turns on when the input pin is pulled LOW.
+            If both relays click on at boot and the motor runs unexpectedly,
+            your board is active-low: set this to 0.
+
+    config ESP_RELAY_REVERSE_DELAY_MS
+        int "Direction-reversal dead time (ms)"
+        default 500
+        range 0 5000
+        help
+            Minimum time both relays are held OFF before energising the opposite
+            direction. AC tubular motors must not be reversed instantly; a short
+            dead time protects the motor and its run capacitor. 0 disables it.
+
     config ESP_TTP_UP_GPIO
         int "TTP223 UP signal GPIO"
         default 32
@@ -225,6 +246,74 @@ menu "StudioPieters"
                 The DO pin must remain stable for this long before a state change
                 is acted upon. 2000 ms prevents false triggers from brief drizzle
                 or sensor noise. Applies to both rain-start and rain-stop events.
+
+    endmenu
+
+    menu "Light Sensor (optional)"
+
+        config LUX_SENSOR_ENABLE
+            bool "Enable ambient light sensor (BH1750)"
+            default n
+            help
+                Enable a BH1750 (GY-302) digital ambient-light sensor over I2C.
+                When the measured illuminance rises above the close threshold the
+                sunshade lowers automatically for sun protection, and restores its
+                previous position once the light drops below the reopen threshold.
+                Wiring: VCC -> 3.3 V, GND -> GND, SDA/SCL -> the GPIOs below,
+                ADDR -> GND (address 0x23) or 3.3 V (address 0x5C).
+
+        config LUX_SENSOR_SDA_GPIO
+            int "BH1750 I2C SDA GPIO"
+            default 21
+            depends on LUX_SENSOR_ENABLE
+            help
+                GPIO connected to the BH1750 SDA pin. Default ESP32 SDA is GPIO21.
+
+        config LUX_SENSOR_SCL_GPIO
+            int "BH1750 I2C SCL GPIO"
+            default 22
+            depends on LUX_SENSOR_ENABLE
+            help
+                GPIO connected to the BH1750 SCL pin. Default ESP32 SCL is GPIO22.
+
+        config LUX_SENSOR_I2C_ADDR
+            hex "BH1750 I2C address"
+            default 0x23
+            range 0x23 0x5C
+            depends on LUX_SENSOR_ENABLE
+            help
+                7-bit I2C address. 0x23 when ADDR is tied to GND (default),
+                0x5C when ADDR is tied to 3.3 V.
+
+        config LUX_SENSOR_CLOSE_THRESHOLD_LUX
+            int "Auto-close threshold (lux)"
+            default 40000
+            range 1 100000
+            depends on LUX_SENSOR_ENABLE
+            help
+                Illuminance above which the sunshade closes for sun protection.
+                Bright direct sunlight is roughly 30000-100000 lux; an overcast
+                day is a few thousand lux. 40000 is a sensible default.
+
+        config LUX_SENSOR_REOPEN_THRESHOLD_LUX
+            int "Re-open hysteresis threshold (lux)"
+            default 20000
+            range 1 100000
+            depends on LUX_SENSOR_ENABLE
+            help
+                Illuminance below which the sunshade restores its previous
+                position. Must be lower than the close threshold to prevent
+                rapid cycling when the light hovers near the limit.
+
+        config LUX_SENSOR_POLL_MS
+            int "Light sensor poll interval (ms)"
+            default 5000
+            range 1000 60000
+            depends on LUX_SENSOR_ENABLE
+            help
+                Interval between BH1750 reads. The sensor needs ~120 ms per
+                high-resolution conversion; 5000 ms avoids reacting to passing
+                clouds while staying responsive.
 
     endmenu
 

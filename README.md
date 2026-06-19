@@ -23,6 +23,7 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 12. [OTA updates](#12-ota-updates)
 13. [Wind speed sensor (optional)](#13-wind-speed-sensor-optional)
 14. [Rain sensor (optional)](#14-rain-sensor-optional)
+- [Light sensor (optional)](#light-sensor-optional--bh1750)
 15. [Sunrise / sunset automations](#15-sunrise--sunset-automations)
 16. [Menuconfig reference](#16-menuconfig-reference)
 17. [NVS storage layout](#17-nvs-storage-layout)
@@ -77,6 +78,10 @@ GND (common) ──────────► motor common
 ```
 
 > **Important:** Never wire OPEN and CLOSE to the same motor terminal simultaneously. The software interlock already prevents both relays from being energised at the same time, but double-check your wiring.
+
+> **Relay active level:** The firmware drives the relays active-high by default (`ESP_RELAY_ACTIVE_LEVEL = 1`). Many common opto-isolated 2-channel modules are **active-low** (the relay turns on when the input pin is pulled LOW). If both relays click on at boot and the motor runs unexpectedly, set `ESP_RELAY_ACTIVE_LEVEL = 0` in menuconfig. Always test with the motor mechanically disconnected first.
+
+> **Direction-reversal dead time:** AC tubular motors must not be switched straight from one direction to the other. Before energising the opposite direction the firmware holds both relays off for `ESP_RELAY_REVERSE_DELAY_MS` (default 500 ms). A hardware interlock (cross-wired NC contacts) is still recommended for mains-driven motors.
 
 ### Touch pad construction
 
@@ -453,6 +458,61 @@ Mount the sensing pad under a sheltered overhang so only falling rain reaches it
 
 ---
 
+## Light sensor (optional) — BH1750
+
+A **BH1750** (GY-302) digital ambient-light sensor can automatically lower the sunshade in bright sun and restore the previous position once it clouds over.
+
+Enable via `idf.py menuconfig` → **StudioPieters** → **Light Sensor**.
+
+### Sensor characteristics
+
+| Property | Value |
+|----------|-------|
+| Module | BH1750 / GY-302 (I²C) |
+| Power | VCC = 3.3 V, GND = GND |
+| Bus | I²C — SDA (default GPIO21), SCL (default GPIO22) |
+| Address | `0x23` (ADDR → GND, default) or `0x5C` (ADDR → 3.3 V) |
+| Mode | Continuous high-resolution (1 lux, ~120 ms/sample) |
+| Conversion | `lux = raw_count / 1.2` |
+
+### Wiring
+
+```
+BH1750 (GY-302)
+    VCC ──► 3.3 V
+    GND ──► GND
+    SDA ──► ESP32 GPIO21
+    SCL ──► ESP32 GPIO22
+    ADDR   (GND = 0x23, default) or (3.3 V = 0x5C)
+```
+
+> GY-302 breakouts include onboard I²C pull-ups. The firmware also enables the ESP32 internal pull-ups as a safety net.
+
+### Behaviour
+
+| Condition | Action |
+|-----------|--------|
+| Light ≥ close threshold (default **40000 lux**) | Sunshade closes; previous target position is saved |
+| Light < reopen threshold (default **20000 lux**) | Sunshade restores to the saved position |
+
+The hysteresis gap (20000 lux by default) prevents rapid cycling when a thin cloud passes. Bright direct sun is roughly 30000–100000 lux; an overcast day is a few thousand lux.
+
+### Menuconfig keys
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `LUX_SENSOR_ENABLE` | n | Enable BH1750 light sensor |
+| `LUX_SENSOR_SDA_GPIO` | 21 | I²C SDA GPIO |
+| `LUX_SENSOR_SCL_GPIO` | 22 | I²C SCL GPIO |
+| `LUX_SENSOR_I2C_ADDR` | 0x23 | 7-bit I²C address (0x23 or 0x5C) |
+| `LUX_SENSOR_CLOSE_THRESHOLD_LUX` | 40000 | Auto-close threshold in lux |
+| `LUX_SENSOR_REOPEN_THRESHOLD_LUX` | 20000 | Reopen hysteresis threshold in lux |
+| `LUX_SENSOR_POLL_MS` | 5000 | Poll interval in ms |
+
+> Wind, rain and light protection share the same override mechanism: whichever triggers saves the current HomeKit target and restores it when the condition clears.
+
+---
+
 ## 15. Sunrise / sunset automations
 
 No firmware changes are needed. The Home app has built-in sunrise/sunset automation that uses your Home Hub's GPS location and local timezone — more accurate than any on-device calculation.
@@ -511,6 +571,8 @@ Open with `idf.py menuconfig` → **StudioPieters**.
 | `ESP_BUTTON_GPIO` | 25 | GPIO for the physical push button |
 | `ESP_RELAY_OPEN_GPIO` | 16 | GPIO for the OPEN/UP relay |
 | `ESP_RELAY_CLOSE_GPIO` | 17 | GPIO for the CLOSE/DOWN relay |
+| `ESP_RELAY_ACTIVE_LEVEL` | 1 | Level that energises a relay (1 = active-high, 0 = active-low boards) |
+| `ESP_RELAY_REVERSE_DELAY_MS` | 500 | Dead time both relays stay off before reversing direction |
 | `ESP_TTP_UP_GPIO` | 32 | TTP223 UP module signal GPIO |
 | `ESP_TTP_STOP_GPIO` | 33 | TTP223 STOP module signal GPIO |
 | `ESP_TTP_DOWN_GPIO` | 27 | TTP223 DOWN module signal GPIO |
@@ -638,6 +700,21 @@ Recalibrate. Measure the actual travel time with a stopwatch; if it differs sign
 ```bash
 rm -rf build
 idf.py set-target esp32
+```
+
+---
+
+## Continuous integration & tests
+
+Every push and pull request runs two GitHub Actions jobs (`.github/workflows/build.yml`):
+
+1. **Host unit tests** — compile and run `test/test_sunshade_logic.c` against the pure logic in `main/sunshade_logic.h` (relay polarity, position math, sensor conversions, hysteresis). No hardware or ESP-IDF needed.
+2. **ESP-IDF build** — builds the full firmware for `esp32` on ESP-IDF v5.3.2 and v5.4.1. Runs only after the unit tests pass.
+
+Run the unit tests locally:
+
+```bash
+cc -std=c11 -Wall -Wextra -Werror -I main test/test_sunshade_logic.c -o /tmp/sunshade_test && /tmp/sunshade_test
 ```
 
 ---
