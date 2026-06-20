@@ -66,6 +66,17 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 | Push button (momentary) | 1 | NO type, wired GND → button → GPIO25 |
 | LED + current-limiting resistor | 1 | Identify LED on GPIO23 |
 
+### Optional components
+
+| Component | Notes |
+|-----------|-------|
+| HWFS-1 anemometer + voltage divider | Wind protection — auto-close on high wind ([details](#13-wind-speed-sensor-optional--hwfs-1)) |
+| MH-RD / FC-37 rain module | Rain protection — auto-close when it rains ([details](#14-rain-sensor-optional--mh-rd)) |
+| BH1750 (GY-302) light sensor | Sun protection + HomeKit light tile ([details](#light-sensor-optional--bh1750)) |
+| SHT3x (SHT30/31/35) climate sensor | HomeKit temperature & humidity tiles ([details](#temperature--humidity-sensor-optional--sht3x)) |
+
+> The BH1750 and SHT3x share one I²C bus. Each optional sensor is enabled separately in `idf.py menuconfig`.
+
 ### Schematic
 
 ![HomeKit Sunshade wiring diagram](Sunshade.jpg)
@@ -764,10 +775,13 @@ idf.py set-target esp32
 
 ## Continuous integration & tests
 
-Every push and pull request runs two GitHub Actions jobs (`.github/workflows/build.yml`):
+Every push and pull request runs three GitHub Actions jobs (`.github/workflows/build.yml`):
 
-1. **Host unit tests** — compile and run `test/test_sunshade_logic.c` against the pure logic in `main/sunshade_logic.h` (relay polarity, position math, sensor conversions, hysteresis). No hardware or ESP-IDF needed.
-2. **ESP-IDF build** — builds the full firmware for `esp32` on ESP-IDF v5.3.2 and v5.4.1. Runs only after the unit tests pass.
+1. **Host unit tests** — compile and run `test/test_sunshade_logic.c` against the pure logic in `main/sunshade_logic.h` (relay polarity, position math, sensor conversions, SHT3x/CRC, hysteresis). No hardware or ESP-IDF needed.
+2. **ESP-IDF build** — builds the firmware for `esp32` on ESP-IDF v5.3.2 and v5.4.1 with the default config (all optional sensors off).
+3. **ESP-IDF build (all sensors enabled)** — builds with `sdkconfig.ci.sensors` so the wind, rain, BH1750 and SHT3x code paths are actually compiled.
+
+The build jobs run only after the unit tests pass.
 
 Run the unit tests locally:
 
