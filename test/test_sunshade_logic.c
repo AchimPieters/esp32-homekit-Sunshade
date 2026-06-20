@@ -99,6 +99,22 @@ static void test_bh1750_lux(void) {
     CHECK(bh1750_raw_to_lux(60000) == 50000);
 }
 
+static void test_sht3x(void) {
+    printf("sht3x conversions + CRC\n");
+    // Datasheet endpoints: raw 0 -> -45 C, raw 65535 -> +130 C.
+    CHECK_FLOAT(sht3x_raw_to_celsius(0),     -45.0f);
+    CHECK_FLOAT(sht3x_raw_to_celsius(65535), 130.0f);
+    // Mid-scale ~ 42.5 C.
+    CHECK_FLOAT(sht3x_raw_to_celsius(32768),  42.502f);
+    // Humidity endpoints and clamp.
+    CHECK_FLOAT(sht3x_raw_to_humidity(0),     0.0f);
+    CHECK_FLOAT(sht3x_raw_to_humidity(65535), 100.0f);
+    CHECK_FLOAT(sht3x_raw_to_humidity(32768), 50.0008f);
+    // Sensirion datasheet CRC check value.
+    CHECK(sensirion_crc8(0xBE, 0xEF) == 0x92);
+    CHECK(sensirion_crc8(0x00, 0x00) == 0x81);
+}
+
 int main(void) {
     printf("== sunshade logic unit tests ==\n");
     test_relay_output_level();
@@ -107,6 +123,7 @@ int main(void) {
     test_sensor_hysteresis();
     test_wind_speed_ds();
     test_bh1750_lux();
+    test_sht3x();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures != 0) {

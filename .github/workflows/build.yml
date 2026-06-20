@@ -41,3 +41,20 @@ jobs:
           esp_idf_version: ${{ matrix.idf_version }}
           target: esp32
           path: "."
+
+  build-sensors:
+    name: ESP-IDF build (all sensors enabled)
+    needs: logic-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with wind, rain, light and temp/humidity enabled
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.1
+          target: esp32
+          path: "."
+          command: SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.sensors" idf.py build

@@ -24,6 +24,7 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 13. [Wind speed sensor (optional)](#13-wind-speed-sensor-optional)
 14. [Rain sensor (optional)](#14-rain-sensor-optional)
 - [Light sensor (optional)](#light-sensor-optional--bh1750)
+- [Temperature & humidity sensor (optional)](#temperature--humidity-sensor-optional--sht3x)
 15. [Sunrise / sunset automations](#15-sunrise--sunset-automations)
 16. [Menuconfig reference](#16-menuconfig-reference)
 17. [NVS storage layout](#17-nvs-storage-layout)
@@ -48,6 +49,7 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 | **Position tracking** | Time-based, 0–100 %, notified on change (max every 500 ms, HAP-compliant) |
 | **OTA** | Firmware update via HomeKit custom characteristic or single button press |
 | **Weather protection (optional)** | Auto-close on high wind (HWFS-1), rain (MH-RD) or bright sun (BH1750); restores the previous position when the condition clears |
+| **Environmental sensors (optional)** | Temperature & humidity (SHT3x) and ambient light (BH1750) shown in the Home app as HomeKit sensor tiles |
 | **Lifecycle Manager** | WiFi, NVS, factory reset, reboot counter via `esp32-lcm` |
 
 ---
@@ -115,8 +117,10 @@ Only used when the matching feature is enabled in `menuconfig`:
 |------|----------|-----------|-------|
 | **GPIO34** | HWFS-1 wind sensor | ADC1 input | Via voltage divider; see [Wind sensor](#13-wind-speed-sensor-optional--hwfs-1) |
 | **GPIO35** | MH-RD rain sensor | Digital input | DO pin, active-low; see [Rain sensor](#14-rain-sensor-optional--mh-rd) |
-| **GPIO21** | BH1750 light sensor SDA | I²C | See [Light sensor](#light-sensor-optional--bh1750) |
-| **GPIO22** | BH1750 light sensor SCL | I²C | See [Light sensor](#light-sensor-optional--bh1750) |
+| **GPIO21** | Shared I²C SDA | I²C | BH1750 + SHT3x; see [Light](#light-sensor-optional--bh1750) / [Climate](#temperature--humidity-sensor-optional--sht3x) |
+| **GPIO22** | Shared I²C SCL | I²C | BH1750 + SHT3x on the same bus |
+
+> The BH1750 light sensor and the SHT3x temperature/humidity sensor share one I²C bus, so SDA/SCL are configured once (`I2C_MASTER_SDA_GPIO` / `I2C_MASTER_SCL_GPIO`).
 
 All defaults are configurable via `idf.py menuconfig` → **StudioPieters**.
 
@@ -472,9 +476,9 @@ Mount the sensing pad under a sheltered overhang so only falling rain reaches it
 
 ## Light sensor (optional) — BH1750
 
-A **BH1750** (GY-302) digital ambient-light sensor can automatically lower the sunshade in bright sun and restore the previous position once it clouds over.
+A **BH1750** (GY-302) digital ambient-light sensor can automatically lower the sunshade in bright sun and restore the previous position once it clouds over. The illuminance is also published as a **HomeKit Light sensor** tile in the Home app.
 
-Enable via `idf.py menuconfig` → **StudioPieters** → **Light Sensor**.
+Enable via `idf.py menuconfig` → **StudioPieters** → **Light Sensor**. It shares the I²C bus with the SHT3x climate sensor, so SDA/SCL are set once under the shared I²C keys.
 
 ### Sensor characteristics
 
@@ -514,14 +518,56 @@ The hysteresis gap (20000 lux by default) prevents rapid cycling when a thin clo
 | Config key | Default | Description |
 |------------|---------|-------------|
 | `LUX_SENSOR_ENABLE` | n | Enable BH1750 light sensor |
-| `LUX_SENSOR_SDA_GPIO` | 21 | I²C SDA GPIO |
-| `LUX_SENSOR_SCL_GPIO` | 22 | I²C SCL GPIO |
 | `LUX_SENSOR_I2C_ADDR` | 0x23 | 7-bit I²C address (0x23 or 0x5C) |
 | `LUX_SENSOR_CLOSE_THRESHOLD_LUX` | 40000 | Auto-close threshold in lux |
 | `LUX_SENSOR_REOPEN_THRESHOLD_LUX` | 20000 | Reopen hysteresis threshold in lux |
 | `LUX_SENSOR_POLL_MS` | 5000 | Poll interval in ms |
+| `I2C_MASTER_SDA_GPIO` | 21 | Shared I²C SDA GPIO (BH1750 + SHT3x) |
+| `I2C_MASTER_SCL_GPIO` | 22 | Shared I²C SCL GPIO (BH1750 + SHT3x) |
 
 > Wind, rain and light protection share the same override mechanism: whichever triggers saves the current HomeKit target and restores it when the condition clears.
+
+---
+
+## Temperature & humidity sensor (optional) — SHT3x
+
+A **Sensirion SHT3x** (SHT30/31/35) measures temperature and relative humidity over I²C. Both readings are published as **HomeKit Temperature and Humidity sensor** tiles in the Home app. They are display-only — they do **not** move the sunshade.
+
+Enable via `idf.py menuconfig` → **StudioPieters** → **Temperature & Humidity Sensor**.
+
+### Sensor characteristics
+
+| Property | Value |
+|----------|-------|
+| Module | Sensirion SHT30 / SHT31 / SHT35 (I²C) |
+| Power | VCC = 3.3 V, GND = GND |
+| Bus | Shared I²C — SDA (default GPIO21), SCL (default GPIO22) |
+| Address | `0x44` (ADDR → GND, default) or `0x45` (ADDR → 3.3 V) |
+| Mode | Single-shot, high repeatability, clock stretching disabled |
+| Range | −40…+125 °C, 0…100 %RH; each sample is CRC-8 validated |
+
+### Wiring
+
+```
+SHT3x
+    VCC ──► 3.3 V
+    GND ──► GND
+    SDA ──► ESP32 GPIO21   (shared with BH1750)
+    SCL ──► ESP32 GPIO22   (shared with BH1750)
+    ADDR   (GND = 0x44, default) or (3.3 V = 0x45)
+```
+
+> The SHT3x and BH1750 live on the same I²C bus. Wire both SDA lines together and both SCL lines together; the firmware addresses each device separately (0x44 vs 0x23).
+
+### Menuconfig keys
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `TEMP_SENSOR_ENABLE` | n | Enable SHT3x temperature & humidity sensor |
+| `TEMP_SENSOR_I2C_ADDR` | 0x44 | 7-bit I²C address (0x44 or 0x45) |
+| `TEMP_SENSOR_POLL_MS` | 10000 | Poll interval in ms |
+| `I2C_MASTER_SDA_GPIO` | 21 | Shared I²C SDA GPIO (BH1750 + SHT3x) |
+| `I2C_MASTER_SCL_GPIO` | 22 | Shared I²C SCL GPIO (BH1750 + SHT3x) |
 
 ---
 

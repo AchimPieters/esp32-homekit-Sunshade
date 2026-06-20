@@ -77,3 +77,31 @@ static inline int wind_speed_ds(int mv, int full_scale_mv, int max_speed_ds) {
 static inline int bh1750_raw_to_lux(uint16_t raw) {
     return (int)((float)raw / 1.2f + 0.5f);
 }
+
+// ── SHT3x temperature / humidity conversions ────────────────────────────────
+// Sensirion SHT3x datasheet conversions for a raw 16-bit sample.
+static inline float sht3x_raw_to_celsius(uint16_t raw) {
+    return -45.0f + 175.0f * (float)raw / 65535.0f;
+}
+
+static inline float sht3x_raw_to_humidity(uint16_t raw) {
+    float rh = 100.0f * (float)raw / 65535.0f;
+    if (rh < 0.0f)   return 0.0f;
+    if (rh > 100.0f) return 100.0f;
+    return rh;
+}
+
+// Sensirion CRC-8 over a 16-bit word (polynomial 0x31, init 0xFF). Used to
+// validate each SHT3x word; datasheet check value: CRC(0xBE, 0xEF) == 0x92.
+static inline uint8_t sensirion_crc8(uint8_t msb, uint8_t lsb) {
+    uint8_t data[2] = { msb, lsb };
+    uint8_t crc = 0xFF;
+    for (int i = 0; i < 2; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31)
+                               : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}

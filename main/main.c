@@ -61,8 +61,9 @@
 
 // rain sensor uses only GPIO — no extra include needed
 
-#ifdef CONFIG_LUX_SENSOR_ENABLE
+#if defined(CONFIG_LUX_SENSOR_ENABLE) || defined(CONFIG_TEMP_SENSOR_ENABLE)
 #include <driver/i2c_master.h>
+#define SUNSHADE_USE_I2C 1
 #endif
 
 #include <homekit/homekit.h>
@@ -121,14 +122,24 @@
 #define RAIN_DEBOUNCE_MS   CONFIG_RAIN_SENSOR_DEBOUNCE_MS
 #endif
 
+// ── Shared I2C bus (BH1750 + SHT3x) ───────────────────────────────────────────
+#ifdef SUNSHADE_USE_I2C
+#define I2C_SDA_GPIO        CONFIG_I2C_MASTER_SDA_GPIO
+#define I2C_SCL_GPIO        CONFIG_I2C_MASTER_SCL_GPIO
+#endif
+
 // ── Light sensor (optional) ───────────────────────────────────────────────────
 #ifdef CONFIG_LUX_SENSOR_ENABLE
-#define LUX_SDA_GPIO        CONFIG_LUX_SENSOR_SDA_GPIO
-#define LUX_SCL_GPIO        CONFIG_LUX_SENSOR_SCL_GPIO
 #define LUX_I2C_ADDR        CONFIG_LUX_SENSOR_I2C_ADDR
 #define LUX_CLOSE_LUX       CONFIG_LUX_SENSOR_CLOSE_THRESHOLD_LUX
 #define LUX_REOPEN_LUX      CONFIG_LUX_SENSOR_REOPEN_THRESHOLD_LUX
 #define LUX_POLL_MS         CONFIG_LUX_SENSOR_POLL_MS
+#endif
+
+// ── Temperature & humidity sensor (optional) ──────────────────────────────────
+#ifdef CONFIG_TEMP_SENSOR_ENABLE
+#define TEMP_I2C_ADDR       CONFIG_TEMP_SENSOR_I2C_ADDR
+#define TEMP_POLL_MS        CONFIG_TEMP_SENSOR_POLL_MS
 #endif
 
 // ── Log tags ──────────────────────────────────────────────────────────────────
@@ -146,6 +157,12 @@ static const char *TAG_RAIN   = "RAIN";
 #endif
 #ifdef CONFIG_LUX_SENSOR_ENABLE
 static const char *TAG_LUX    = "LUX";
+#endif
+#ifdef CONFIG_TEMP_SENSOR_ENABLE
+static const char *TAG_TEMP   = "SHT3X";
+#endif
+#ifdef SUNSHADE_USE_I2C
+static const char *TAG_I2C    = "I2C";
 #endif
 
 // ── Motion state ──────────────────────────────────────────────────────────────
@@ -359,6 +376,26 @@ static homekit_characteristic_t pos_state_ch =
 static homekit_characteristic_t hold_pos_ch =
     HOMEKIT_CHARACTERISTIC_(HOLD_POSITION, false,
         .setter = hold_position_setter);
+
+// ── Environmental sensor characteristics (display-only) ───────────────────────
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverride-init"
+#ifdef CONFIG_TEMP_SENSOR_ENABLE
+// Widen the default 0–100 °C range to the SHT3x range so outdoor sub-zero
+// temperatures are reported instead of being clamped at 0 °C.
+static homekit_characteristic_t cur_temp_ch =
+    HOMEKIT_CHARACTERISTIC_(CURRENT_TEMPERATURE, 0,
+        .min_value = (float[]) {-40},
+        .max_value = (float[]) {125});
+static homekit_characteristic_t cur_humid_ch =
+    HOMEKIT_CHARACTERISTIC_(CURRENT_RELATIVE_HUMIDITY, 0);
+#endif
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+// HAP CURRENT_AMBIENT_LIGHT_LEVEL valid range is 0.0001–100000 lux.
+static homekit_characteristic_t cur_lux_ch =
+    HOMEKIT_CHARACTERISTIC_(CURRENT_AMBIENT_LIGHT_LEVEL, 0.0001f);
+#endif
+#pragma GCC diagnostic pop
 
 static void homekit_notify_position(void) {
     current_pos_ch.value = HOMEKIT_UINT8((uint8_t)s_cur_pos);
@@ -909,6 +946,25 @@ homekit_accessory_t *accessories[] = {
             &ota_trigger,
             NULL
         }),
+#ifdef CONFIG_TEMP_SENSOR_ENABLE
+        HOMEKIT_SERVICE(TEMPERATURE_SENSOR, .characteristics = (homekit_characteristic_t*[]) {
+            HOMEKIT_CHARACTERISTIC(NAME, "Temperature"),
+            &cur_temp_ch,
+            NULL
+        }),
+        HOMEKIT_SERVICE(HUMIDITY_SENSOR, .characteristics = (homekit_characteristic_t*[]) {
+            HOMEKIT_CHARACTERISTIC(NAME, "Humidity"),
+            &cur_humid_ch,
+            NULL
+        }),
+#endif
+#ifdef CONFIG_LUX_SENSOR_ENABLE
+        HOMEKIT_SERVICE(LIGHT_SENSOR, .characteristics = (homekit_characteristic_t*[]) {
+            HOMEKIT_CHARACTERISTIC(NAME, "Ambient Light"),
+            &cur_lux_ch,
+            NULL
+        }),
+#endif
         NULL
     }),
     NULL
@@ -1337,6 +1393,34 @@ static void rain_task(void *arg) {
 }
 #endif
 
+// ── Shared I2C bus ────────────────────────────────────────────────────────────
+// The BH1750 light sensor and the SHT3x climate sensor share one I2C bus. It is
+// created once from app_main before the sensor tasks start, so there is no race
+// and no double initialisation.
+#ifdef SUNSHADE_USE_I2C
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
+
+static esp_err_t i2c_bus_init(void) {
+    i2c_master_bus_config_t bus_cfg = {
+        .clk_source                   = I2C_CLK_SRC_DEFAULT,
+        .i2c_port                     = I2C_NUM_0,
+        .scl_io_num                   = I2C_SCL_GPIO,
+        .sda_io_num                   = I2C_SDA_GPIO,
+        .glitch_ignore_cnt            = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_I2C, "I2C bus init failed (SDA=%d SCL=%d): %s",
+                 I2C_SDA_GPIO, I2C_SCL_GPIO, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG_I2C, "I2C bus ready (SDA=%d SCL=%d)", I2C_SDA_GPIO, I2C_SCL_GPIO);
+    }
+    return err;
+}
+#endif
+
 // ── Ambient light sensor ──────────────────────────────────────────────────────
 #ifdef CONFIG_LUX_SENSOR_ENABLE
 /*
@@ -1359,23 +1443,6 @@ static void rain_task(void *arg) {
 #define BH1750_CMD_CONT_HRES     0x10
 
 static void lux_task(void *arg) {
-    i2c_master_bus_config_t bus_cfg = {
-        .clk_source                 = I2C_CLK_SRC_DEFAULT,
-        .i2c_port                   = I2C_NUM_0,
-        .scl_io_num                 = LUX_SCL_GPIO,
-        .sda_io_num                 = LUX_SDA_GPIO,
-        .glitch_ignore_cnt          = 7,
-        .flags.enable_internal_pullup = true,
-    };
-
-    i2c_master_bus_handle_t bus = NULL;
-    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
-        ESP_LOGE(TAG_LUX, "I2C bus init failed (SDA=%d SCL=%d); lux task disabled",
-                 LUX_SDA_GPIO, LUX_SCL_GPIO);
-        vTaskDelete(NULL);
-        return;
-    }
-
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = LUX_I2C_ADDR,
@@ -1383,9 +1450,8 @@ static void lux_task(void *arg) {
     };
 
     i2c_master_dev_handle_t dev = NULL;
-    if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) != ESP_OK) {
+    if (i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &dev) != ESP_OK) {
         ESP_LOGE(TAG_LUX, "BH1750 not added at 0x%02X; lux task disabled", LUX_I2C_ADDR);
-        i2c_del_master_bus(bus);
         vTaskDelete(NULL);
         return;
     }
@@ -1398,16 +1464,13 @@ static void lux_task(void *arg) {
         ESP_LOGE(TAG_LUX, "BH1750 not responding at 0x%02X; check wiring/address",
                  LUX_I2C_ADDR);
         i2c_master_bus_rm_device(dev);
-        i2c_del_master_bus(bus);
         vTaskDelete(NULL);
         return;
     }
 
     ESP_LOGI(TAG_LUX,
-             "BH1750 ready: addr 0x%02X SDA=%d SCL=%d | close >= %d lux | "
-             "reopen < %d lux | poll %d ms",
-             LUX_I2C_ADDR, LUX_SDA_GPIO, LUX_SCL_GPIO,
-             LUX_CLOSE_LUX, LUX_REOPEN_LUX, LUX_POLL_MS);
+             "BH1750 ready: addr 0x%02X | close >= %d lux | reopen < %d lux | poll %d ms",
+             LUX_I2C_ADDR, LUX_CLOSE_LUX, LUX_REOPEN_LUX, LUX_POLL_MS);
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(LUX_POLL_MS));
@@ -1423,6 +1486,11 @@ static void lux_task(void *arg) {
 
         ESP_LOGI(TAG_LUX, "%d lux (raw=%u)", lux, count);
 
+        // Publish to HomeKit (clamped to the HAP valid range 0.0001–100000 lux).
+        float hk_lux = (lux < 1) ? 0.0001f : (float)lux;
+        cur_lux_ch.value = HOMEKIT_FLOAT(hk_lux);
+        homekit_characteristic_notify(&cur_lux_ch, cur_lux_ch.value);
+
         sensor_action_t act = sensor_hysteresis(s_lux_closed, lux,
                                                 LUX_CLOSE_LUX, LUX_REOPEN_LUX);
         if (act == SENSOR_TRIGGER_CLOSE) {
@@ -1437,6 +1505,84 @@ static void lux_task(void *arg) {
             s_lux_closed = false;
             sunshade_move_to(s_lux_saved_pos);
         }
+    }
+}
+#endif
+
+// ── Temperature & humidity sensor ─────────────────────────────────────────────
+#ifdef CONFIG_TEMP_SENSOR_ENABLE
+/*
+ * Sensirion SHT3x (SHT30/31/35) — implementation notes:
+ *
+ * BUS:     Shared I2C bus. VCC = 3.3 V, GND = GND.
+ * ADDRESS: 0x44 when ADDR is tied LOW (default), 0x45 when tied HIGH.
+ * READ:    Single-shot, high repeatability, clock stretching disabled (0x2400).
+ *          Wait ~20 ms, then read 6 bytes: temp[MSB,LSB,CRC], hum[MSB,LSB,CRC].
+ *          Each 16-bit word is CRC-8 protected (poly 0x31, init 0xFF).
+ *
+ * USE:     Display only — published as HomeKit Temperature and Humidity sensors.
+ *          The readings never move the sunshade.
+ */
+#define SHT3X_CMD_MEAS_HIGH_MSB  0x24
+#define SHT3X_CMD_MEAS_HIGH_LSB  0x00
+
+static void temp_task(void *arg) {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = TEMP_I2C_ADDR,
+        .scl_speed_hz    = 100000,
+    };
+
+    i2c_master_dev_handle_t dev = NULL;
+    if (i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &dev) != ESP_OK) {
+        ESP_LOGE(TAG_TEMP, "SHT3x not added at 0x%02X; temp task disabled", TEMP_I2C_ADDR);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG_TEMP, "SHT3x ready: addr 0x%02X | poll %d ms", TEMP_I2C_ADDR, TEMP_POLL_MS);
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(TEMP_POLL_MS));
+
+        uint8_t cmd[2] = { SHT3X_CMD_MEAS_HIGH_MSB, SHT3X_CMD_MEAS_HIGH_LSB };
+        if (i2c_master_transmit(dev, cmd, sizeof(cmd), 1000) != ESP_OK) {
+            ESP_LOGW(TAG_TEMP, "SHT3x measure command failed");
+            continue;
+        }
+
+        // High-repeatability conversion takes up to 15 ms; allow margin.
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        uint8_t raw[6] = {0};
+        if (i2c_master_receive(dev, raw, sizeof(raw), 1000) != ESP_OK) {
+            ESP_LOGW(TAG_TEMP, "SHT3x read failed");
+            continue;
+        }
+
+        if (sensirion_crc8(raw[0], raw[1]) != raw[2] ||
+            sensirion_crc8(raw[3], raw[4]) != raw[5]) {
+            ESP_LOGW(TAG_TEMP, "SHT3x CRC mismatch; discarding sample");
+            continue;
+        }
+
+        uint16_t t_raw = (uint16_t)((raw[0] << 8) | raw[1]);
+        uint16_t h_raw = (uint16_t)((raw[3] << 8) | raw[4]);
+
+        float temp_c   = sht3x_raw_to_celsius(t_raw);
+        float humid_pct = sht3x_raw_to_humidity(h_raw);
+
+        // Integer-formatted log (avoids %f, which newlib nano-format omits).
+        int t_tenths = (int)(temp_c * 10.0f);
+        int h_tenths = (int)(humid_pct * 10.0f);
+        ESP_LOGI(TAG_TEMP, "%d.%d C, %d.%d %%RH",
+                 t_tenths / 10, (t_tenths < 0 ? -t_tenths : t_tenths) % 10,
+                 h_tenths / 10, h_tenths % 10);
+
+        cur_temp_ch.value  = HOMEKIT_FLOAT(temp_c);
+        cur_humid_ch.value = HOMEKIT_FLOAT(humid_pct);
+        homekit_characteristic_notify(&cur_temp_ch, cur_temp_ch.value);
+        homekit_characteristic_notify(&cur_humid_ch, cur_humid_ch.value);
     }
 }
 #endif
@@ -1505,9 +1651,28 @@ void app_main(void) {
     }
 #endif
 
+#ifdef SUNSHADE_USE_I2C
+    // Bring up the shared I2C bus once before any I2C sensor task starts.
+    bool i2c_ready = (i2c_bus_init() == ESP_OK);
+#endif
+
 #ifdef CONFIG_LUX_SENSOR_ENABLE
-    if (xTaskCreate(lux_task, "lux_task", 3072, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create lux task");
+    if (i2c_ready) {
+        if (xTaskCreate(lux_task, "lux_task", 3072, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create lux task");
+        }
+    } else {
+        ESP_LOGE(TAG, "I2C bus unavailable; lux sensor disabled");
+    }
+#endif
+
+#ifdef CONFIG_TEMP_SENSOR_ENABLE
+    if (i2c_ready) {
+        if (xTaskCreate(temp_task, "temp_task", 3072, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create temp task");
+        }
+    } else {
+        ESP_LOGE(TAG, "I2C bus unavailable; temp/humidity sensor disabled");
     }
 #endif
 

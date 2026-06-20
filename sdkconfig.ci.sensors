@@ -1,0 +1,7 @@
+# CI-only overlay: enable every optional sensor so the wind, rain, BH1750 light
+# and SHT3x temperature/humidity code paths are actually compiled. Layered on
+# top of sdkconfig.defaults via SDKCONFIG_DEFAULTS in the CI workflow.
+CONFIG_WIND_SENSOR_ENABLE=y
+CONFIG_RAIN_SENSOR_ENABLE=y
+CONFIG_LUX_SENSOR_ENABLE=y
+CONFIG_TEMP_SENSOR_ENABLE=y
