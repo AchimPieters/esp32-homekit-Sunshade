@@ -39,7 +39,7 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 |---------|---------|
 | **HomeKit service** | `WINDOW_COVERING` – current position, target position, position state, hold position |
 | **Accessory category** | Window Covering (tile icon in the Home app) |
-| **Relay outputs** | GPIO16 (OPEN/UP), GPIO17 (CLOSE/DOWN) with software interlock |
+| **Relay outputs** | GPIO16 (OPEN/UP), GPIO17 (CLOSE/DOWN); software interlock, configurable active level, direction-reversal dead time |
 | **Touch buttons** | TTP223 capacitive modules: UP (GPIO32), STOP (GPIO33), DOWN (GPIO27) |
 | **Physical button** | Push button on GPIO25: single/double/long press |
 | **Identify LED** | GPIO23 – blinks on HomeKit Identify, not visible as a service |
@@ -47,6 +47,7 @@ It replaces a standard UP/DOWN/STOP switch and adds HomeKit control, capacitive 
 | **Power-loss recovery** | On boot: closes fully, then restores last HomeKit position |
 | **Position tracking** | Time-based, 0–100 %, notified on change (max every 500 ms, HAP-compliant) |
 | **OTA** | Firmware update via HomeKit custom characteristic or single button press |
+| **Weather protection (optional)** | Auto-close on high wind (HWFS-1), rain (MH-RD) or bright sun (BH1750); restores the previous position when the condition clears |
 | **Lifecycle Manager** | WiFi, NVS, factory reset, reboot counter via `esp32-lcm` |
 
 ---
@@ -98,13 +99,24 @@ Each capacitive button uses a **TTP223 module** between the electrode and the ES
 
 | GPIO | Function | Direction | Notes |
 |------|----------|-----------|-------|
-| **GPIO16** | OPEN / UP relay | Output | Active HIGH; motor runs UP |
-| **GPIO17** | CLOSE / DOWN relay | Output | Active HIGH; motor runs DOWN |
+| **GPIO16** | OPEN / UP relay | Output | Active level configurable (default HIGH); motor runs UP |
+| **GPIO17** | CLOSE / DOWN relay | Output | Active level configurable (default HIGH); motor runs DOWN |
 | **GPIO23** | Identify LED | Output | Blinks on HomeKit Identify |
 | **GPIO25** | Physical push button | Input | GND → button → GPIO25; active-low |
 | **GPIO27** | TTP223 DOWN signal | Digital input | Active-high; close/lower sunshade |
 | **GPIO32** | TTP223 UP signal | Digital input | Active-high; open/raise sunshade |
 | **GPIO33** | TTP223 STOP signal | Digital input | Active-high; stop + calibration trigger |
+
+### Optional sensor pins
+
+Only used when the matching feature is enabled in `menuconfig`:
+
+| GPIO | Function | Direction | Notes |
+|------|----------|-----------|-------|
+| **GPIO34** | HWFS-1 wind sensor | ADC1 input | Via voltage divider; see [Wind sensor](#13-wind-speed-sensor-optional--hwfs-1) |
+| **GPIO35** | MH-RD rain sensor | Digital input | DO pin, active-low; see [Rain sensor](#14-rain-sensor-optional--mh-rd) |
+| **GPIO21** | BH1750 light sensor SDA | I²C | See [Light sensor](#light-sensor-optional--bh1750) |
+| **GPIO22** | BH1750 light sensor SCL | I²C | See [Light sensor](#light-sensor-optional--bh1750) |
 
 All defaults are configurable via `idf.py menuconfig` → **StudioPieters**.
 
